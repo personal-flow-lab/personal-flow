@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Personal Flow</title>
+  <style>
+    :root { --ink:#1e2522; --green:#11675a; --paper:#f5f3ed; --card:#fffefa; --line:#dedbd0; --muted:#6b706b; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans",sans-serif; }
+    main { max-width:1180px; margin:0 auto; padding:48px 24px 80px; }
+    header { display:flex; justify-content:space-between; gap:28px; align-items:end; padding-bottom:26px; border-bottom:1px solid var(--line); }
+    .eyebrow { color:var(--green); font-size:12px; font-weight:800; letter-spacing:.09em; margin:0 0 7px; }
+    h1 { font-size:43px; letter-spacing:-.055em; margin:0; } h2 { font-size:18px; margin:0 0 14px; } h3 { font-size:17px; margin:0 0 8px; }
+    .sub { color:var(--muted); max-width:450px; margin:0; font-size:14px; line-height:1.7; }
+    .grid { display:grid; grid-template-columns:minmax(300px,.88fr) minmax(400px,1.3fr); gap:20px; margin-top:24px; align-items:start; }
+    .panel,.card { border:1px solid var(--line); background:var(--card); border-radius:17px; box-shadow:0 8px 24px #27271d0a; }
+    .panel { padding:22px; } .card { padding:17px; margin-top:12px; } .card.selected { border-left:4px solid var(--green); }
+    label { display:block; font-size:13px; font-weight:750; margin-top:15px; } input,textarea { width:100%; font:inherit; margin-top:6px; padding:12px; border:1px solid #cbc8bd; border-radius:9px; background:#fff; }
+    textarea { resize:vertical; min-height:105px; } button { border:0; border-radius:9px; padding:12px 15px; color:#fff; background:var(--ink); font:inherit; font-weight:750; cursor:pointer; } button.primary { width:100%; margin-top:18px; background:var(--green); }
+    button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); padding:9px 11px; font-size:13px; } .hint,.meta { color:var(--muted); font-size:12px; line-height:1.6; }
+    .heading { display:flex; justify-content:space-between; align-items:center; gap:12px; } .count { padding:3px 8px; background:#eae8e2; color:var(--muted); border-radius:99px; font-size:12px; }
+    .tools { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 14px; } .empty { padding:32px 0; text-align:center; color:var(--muted); }
+    .note { white-space:pre-line; background:#f1f4ef; border-radius:8px; padding:10px 12px; font-size:14px; color:#4a504c; } .url { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--green); font-size:13px; }
+    .theme { border-left:4px solid var(--green); } .theme p { white-space:pre-line; color:#505650; font-size:14px; line-height:1.65; margin:0; } .hidden { display:none; }
+    footer { color:var(--muted); font-size:12px; margin-top:20px; } @media(max-width:760px) { main { padding:30px 14px; } header { display:block; } .sub { margin-top:12px; } h1 { font-size:34px; } .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><p class="eyebrow">PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div>
+      <p class="sub">流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p>
+    </header>
+    <div class="grid">
+      <section class="panel">
+        <h2>情報を入れる</h2>
+        <p class="hint">URLと、気になった理由だけを残す。保存した内容はこのブラウザにだけ残る。</p>
+        <form id="save-form">
+          <label for="url">記事・動画・ページのURL</label>
+          <input id="url" type="url" placeholder="https://..." required>
+          <label for="title">タイトル（任意）</label>
+          <input id="title" type="text" placeholder="空欄ならURLから名前を作る">
+          <label for="memo">ひとことメモ（任意）</label>
+          <textarea id="memo" placeholder="なぜ気になったか／何に使えそうか"></textarea>
+          <button class="primary" type="submit">Personal Flowに保存</button>
+        </form>
+      </section>
+      <section class="panel">
+        <div class="heading"><h2>保存した情報</h2><span class="count" id="count">0 件</span></div>
+        <div class="tools"><button class="ghost" id="ideas" type="button">最近の情報からnoteの入口を見る</button><button class="ghost" id="clear" type="button">全部消す</button></div>
+        <div id="themes" class="hidden"></div><div id="items"></div>
+      </section>
+    </div>
+    <footer>Personal Flowは自分専用の情報受け箱です。ここで保存した情報は、ブラウザの中だけに保存されます。</footer>
+  </main>
+  <script>
+    const key = 'personal-flow-items-v1';
+    const load = () => JSON.parse(localStorage.getItem(key) || '[]');
+    const save = items => localStorage.setItem(key, JSON.stringify(items));
+    const esc = s => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const titleFor = url => { try { return new URL(url).hostname + ' で見つけた情報'; } catch { return '保存した情報'; } };
+    function render() {
+      const items = load(); const list = document.querySelector('#items'); document.querySelector('#count').textContent = `${items.length} 件`;
+      list.innerHTML = items.length ? items.map(item => `<article class="card"><div class="meta">${esc(item.savedAt)}</div><h3>${esc(item.title)}</h3><a class="url" href="${esc(item.url)}" target="_blank" rel="noreferrer">原文を開く ↗</a><div class="note"><strong>自分のメモ</strong><br>${esc(item.memo || 'まだメモはありません。')}</div></article>`).join('') : '<div class="empty">まだ何もありません。最初のURLを入れてみよう。</div>';
+    }
+    document.querySelector('#save-form').addEventListener('submit', event => {
+      event.preventDefault(); const url = document.querySelector('#url').value.trim(); const title = document.querySelector('#title').value.trim() || titleFor(url); const memo = document.querySelector('#memo').value.trim();
+      const items = load(); items.unshift({url,title,memo,savedAt:new Date().toLocaleString('ja-JP')}); save(items); event.currentTarget.reset(); document.querySelector('#themes').classList.add('hidden'); render();
+    });
+    document.querySelector('#ideas').addEventListener('click', () => {
+      const items = load().slice(0,5); const target = document.querySelector('#themes');
+      if (!items.length) { target.innerHTML = '<div class="empty">まず記事を保存すると、ここにnoteの入口が出る。</div>'; target.classList.remove('hidden'); return; }
+      const sources = items.slice(0,3).map(item => item.title).join(' / '); const firstMemo = items.find(item => item.memo)?.memo || '最近集めた情報を、自分の言葉でどう使うか';
+      target.innerHTML = `<article class="card theme"><h3>最近の情報から、いま考えるべきこと</h3><p>素材: ${esc(sources)}\n切り口: ${esc(firstMemo)}\n\nここから、自分の経験や意見を一つ足してnoteに育てる。</p></article>`; target.classList.remove('hidden');
+    });
+    document.querySelector('#clear').addEventListener('click', () => { if (confirm('保存した情報をすべて消しますか？')) { localStorage.removeItem(key); document.querySelector('#themes').classList.add('hidden'); render(); } });
+    render();
+  </script>
+</body>
+</html>
