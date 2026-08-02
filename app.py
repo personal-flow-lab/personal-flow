@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import sqlite3
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -87,6 +90,63 @@ def themes(items: list[sqlite3.Row]) -> list[tuple[str, str]]:
     ]
 
 
+def suggest_note_themes(items: list[sqlite3.Row]) -> str:
+    """Ask the signed-in Codex CLI for a small set of grounded note ideas.
+
+    This deliberately uses the user's existing Codex login, rather than an API key.
+    """
+    selected = items[:8]
+    if len(selected) < 2:
+        raise ValueError("テーマを出すには、まず記事を2件以上保存してください。")
+
+    sources = []
+    for number, item in enumerate(selected, start=1):
+        excerpt = item["article"][:5000]
+        sources.append(
+            f"【保存 {number}】\n"
+            f"タイトル: {item['title']}\n"
+            f"URL: {item['url']}\n"
+            f"自分のメモ: {item['note'] or 'なし'}\n"
+            f"本文の抜粋: {excerpt}"
+        )
+    prompt = """あなたは、個人が最近読んだ情報からnote記事の種を見つける編集パートナーです。
+以下の保存情報を横断して読み、note記事のテーマを3〜4案だけ提案してください。
+
+守ること:
+- 単に各記事を言い換えず、複数の記事をつなぐ共通点・対比・本人のメモから切り口を作る。
+- 事実を作らない。根拠にした保存番号を各案に添える。
+- 各案は「タイトル」「何を書くか（2文以内）」「使う保存番号」の順。
+- ありきたりな案より、本人が自分の経験や考えを足して書ける案を優先する。
+- 断定できない点は、原文を読み直すべき点として短く示す。
+
+保存情報:
+""" + "\n\n".join(sources)
+
+    with tempfile.NamedTemporaryFile(prefix="personal-flow-theme-", suffix=".txt", delete=False) as output:
+        output_path = Path(output.name)
+    try:
+        completed = subprocess.run(
+            [
+                "codex", "exec", "--ephemeral", "--skip-git-repo-check",
+                "--output-last-message", str(output_path), prompt,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if completed.returncode != 0 or not output_path.exists():
+            raise RuntimeError("Codexからテーマ案を受け取れませんでした。もう一度押してください。")
+        result = output_path.read_text(encoding="utf-8").strip()
+        if not result:
+            raise RuntimeError("Codexからテーマ案を受け取れませんでした。もう一度押してください。")
+        return result
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("テーマ案づくりに時間がかかっています。少ししてからもう一度押してください。") from error
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
 def page(title: str, body: str) -> bytes:
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -140,10 +200,22 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 <div class='grid'><section class='panel'><h2>情報を入れる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
-<section class='panel'><div class='section-head'><h2>保存した情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button outline' href='/themes'>最近の情報からnoteの入口を見る</a><a class='button outline' href='/'>一覧へ戻る</a></div>{theme_cards}{cards}</section></div>"""
+<section class='panel'><div class='section-head'><h2>保存した情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><form method='post' action='/suggest'><button type='submit'>保存した情報からnoteテーマを提案</button></form><a class='button outline' href='/themes'>仮の入口を見る</a><a class='button outline' href='/'>一覧へ戻る</a></div><p class='hint'>保存した記事をまとめてYouが読み、3〜4個のテーマだけ提案します。</p>{theme_cards}{cards}</section></div>"""
         self.send_html(page("情報受け箱", body))
 
     def do_POST(self) -> None:
+        if self.path == "/suggest":
+            items = database().execute("SELECT * FROM items ORDER BY id DESC").fetchall()
+            try:
+                proposal = suggest_note_themes(items)
+                body = f"""
+                <header><div><p class='eyebrow'>NOTE THEME PROPOSAL</p><h1>書けそうなテーマ</h1></div><p class='sub'>保存した{len(items)}件をまとめて読んだ結果です。気になった案だけ、原文と自分のメモを見返して育てよう。</p></header>
+                <section class='panel'><div class='summary'>{html.escape(proposal)}</div><div class='actions'><a class='button' href='/'>保存した情報へ戻る</a></div></section>"""
+                self.send_html(page("noteテーマ", body))
+            except (ValueError, RuntimeError) as error:
+                body = f"<h1>テーマを出せませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
+                self.send_html(page("テーマを出せませんでした", body), 400)
+            return
         if self.path != "/save":
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
@@ -168,6 +240,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     database().close()
-    server = ThreadingHTTPServer(("127.0.0.1", 8765), PersonalFlowHandler)
-    print("Personal Flow is running at http://127.0.0.1:8765")
+    port = int(os.environ.get("PERSONAL_FLOW_PORT", "8765"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), PersonalFlowHandler)
+    print(f"Personal Flow is running at http://127.0.0.1:{port}")
     server.serve_forever()
