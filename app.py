@@ -162,7 +162,15 @@ button,.button{{display:inline-flex;align-items:center;justify-content:center;bo
 .section-head{{display:flex;justify-content:space-between;align-items:center;gap:12px}} .count{{font-size:12px;color:var(--muted);background:#edebe5;border-radius:99px;padding:3px 8px}} .meta{{font-size:12px;color:var(--muted)}} .summary{{white-space:pre-wrap;font-size:14px;margin:12px 0}} .note{{background:#f2f5ef;border-radius:8px;padding:10px 12px;font-size:13px}} a{{color:var(--green)}} .empty{{color:var(--muted);padding:24px 0;text-align:center}}
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid{{grid-template-columns:1fr}}}}
-</style></head><body><main>{body}</main></body></html>""".encode()
+</style></head><body><main>{body}</main><script>
+document.querySelectorAll("form[action='/suggest']").forEach((form) => {{
+  form.addEventListener("submit", () => {{
+    const button = form.querySelector("button");
+    button.disabled = true;
+    button.textContent = "Youがテーマを考えています…";
+  }});
+}});
+</script></body></html>""".encode()
 
 
 class PersonalFlowHandler(BaseHTTPRequestHandler):
