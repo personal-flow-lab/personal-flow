@@ -22,7 +22,7 @@
     .heading { display:flex; justify-content:space-between; align-items:center; gap:12px; } .count { padding:3px 8px; background:#eae8e2; color:var(--muted); border-radius:99px; font-size:12px; }
     .tools { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 14px; } .empty { padding:32px 0; text-align:center; color:var(--muted); }
     .note { white-space:pre-line; background:#f1f4ef; border-radius:8px; padding:10px 12px; font-size:14px; color:#4a504c; } .url { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--green); font-size:13px; }
-    .theme { border-left:4px solid var(--green); } .theme p { white-space:pre-line; color:#505650; font-size:14px; line-height:1.65; margin:0; } .hidden { display:none; }
+    .theme { border-left:4px solid var(--green); } .theme p { white-space:pre-line; color:#505650; font-size:14px; line-height:1.65; margin:0; } .hidden { display:none; } .card-actions { display:flex; gap:8px; margin-top:12px; align-items:center; flex-wrap:wrap; } .copied { color:var(--green); font-size:12px; font-weight:700; }
     footer { color:var(--muted); font-size:12px; margin-top:20px; } @media(max-width:760px) { main { padding:30px 14px; } header { display:block; } .sub { margin-top:12px; } h1 { font-size:34px; } .grid { grid-template-columns:1fr; } }
   </style>
 </head>
@@ -30,7 +30,7 @@
   <main>
     <header>
       <div><p class="eyebrow">PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div>
-      <p class="sub">流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p>
+      <p class="sub">流れてきた情報を受け取り、必要な時にYouへ読ませて、自分の言葉とnoteへつなげるための、あなた専用の場所。</p>
     </header>
     <div class="grid">
       <section class="panel">
@@ -62,7 +62,7 @@
     const titleFor = url => { try { return new URL(url).hostname + ' で見つけた情報'; } catch { return '保存した情報'; } };
     function render() {
       const items = load(); const list = document.querySelector('#items'); document.querySelector('#count').textContent = `${items.length} 件`;
-      list.innerHTML = items.length ? items.map(item => `<article class="card"><div class="meta">${esc(item.savedAt)}</div><h3>${esc(item.title)}</h3><a class="url" href="${esc(item.url)}" target="_blank" rel="noreferrer">原文を開く ↗</a><div class="note"><strong>自分のメモ</strong><br>${esc(item.memo || 'まだメモはありません。')}</div></article>`).join('') : '<div class="empty">まだ何もありません。最初のURLを入れてみよう。</div>';
+      list.innerHTML = items.length ? items.map((item, index) => `<article class="card"><div class="meta">${esc(item.savedAt)}</div><h3>${esc(item.title)}</h3><a class="url" href="${esc(item.url)}" target="_blank" rel="noreferrer">原文を開く ↗</a><div class="note"><strong>自分のメモ</strong><br>${esc(item.memo || 'まだメモはありません。')}</div><div class="card-actions"><button class="ghost request-summary" type="button" data-index="${index}">Youに要約を頼む</button><span class="copied" id="copied-${index}"></span></div></article>`).join('') : '<div class="empty">まだ何もありません。最初のURLを入れてみよう。</div>';
     }
     document.querySelector('#save-form').addEventListener('submit', event => {
       event.preventDefault(); const url = document.querySelector('#url').value.trim(); const title = document.querySelector('#title').value.trim() || titleFor(url); const memo = document.querySelector('#memo').value.trim();
@@ -73,6 +73,13 @@
       if (!items.length) { target.innerHTML = '<div class="empty">まず記事を保存すると、ここにnoteの入口が出る。</div>'; target.classList.remove('hidden'); return; }
       const sources = items.slice(0,3).map(item => item.title).join(' / '); const firstMemo = items.find(item => item.memo)?.memo || '最近集めた情報を、自分の言葉でどう使うか';
       target.innerHTML = `<article class="card theme"><h3>最近の情報から、いま考えるべきこと</h3><p>素材: ${esc(sources)}\n切り口: ${esc(firstMemo)}\n\nここから、自分の経験や意見を一つ足してnoteに育てる。</p></article>`; target.classList.remove('hidden');
+    });
+    document.querySelector('#items').addEventListener('click', async event => {
+      const button = event.target.closest('.request-summary'); if (!button) return;
+      const item = load()[Number(button.dataset.index)]; if (!item) return;
+      const prompt = `このURLを読んで、Personal Flow用に要約してください。\n\nURL: ${item.url}\n気になった理由: ${item.memo || '未入力'}\n\n次の順で短く返してください。\n1. 要点\n2. 自分が読むべきか\n3. noteに使えそうな切り口`;
+      try { await navigator.clipboard.writeText(prompt); } catch { window.prompt('この文章をコピーしてYouに送ってください', prompt); }
+      const notice = document.querySelector(`#copied-${button.dataset.index}`); if (notice) { notice.textContent = '要約依頼をコピーしました'; setTimeout(() => notice.textContent = '', 2600); }
     });
     document.querySelector('#clear').addEventListener('click', () => { if (confirm('保存した情報をすべて消しますか？')) { localStorage.removeItem(key); document.querySelector('#themes').classList.add('hidden'); render(); } });
     render();
