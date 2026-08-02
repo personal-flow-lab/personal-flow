@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import sqlite3
@@ -18,6 +19,8 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "personal-flow.db"
+NOTE_FLOW_ROOT = Path("/Users/kumagainorihiko/Documents/Codex/2026-06-28/30-note-10-1")
+THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
 
 
 def database() -> sqlite3.Connection:
@@ -32,6 +35,15 @@ def database() -> sqlite3.Connection:
             article TEXT NOT NULL DEFAULT '',
             summary TEXT NOT NULL,
             note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS theme_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
         """
@@ -90,7 +102,31 @@ def themes(items: list[sqlite3.Row]) -> list[tuple[str, str]]:
     ]
 
 
-def suggest_note_themes(items: list[sqlite3.Row]) -> str:
+def ask_codex(prompt: str, timeout: int = 180, schema: Path | None = None) -> str:
+    """Use the existing Codex login. No API key is involved."""
+    with tempfile.NamedTemporaryFile(prefix="personal-flow-", suffix=".txt", delete=False) as output:
+        output_path = Path(output.name)
+    command = ["codex", "exec", "--ephemeral", "--skip-git-repo-check"]
+    if schema:
+        command.extend(["--output-schema", str(schema)])
+    command.extend(["--output-last-message", str(output_path), prompt])
+    try:
+        completed = subprocess.run(
+            command, cwd=ROOT, capture_output=True, text=True, timeout=timeout
+        )
+        if completed.returncode != 0 or not output_path.exists():
+            raise RuntimeError("Youから結果を受け取れませんでした。もう一度押してください。")
+        result = output_path.read_text(encoding="utf-8").strip()
+        if not result:
+            raise RuntimeError("Youから結果を受け取れませんでした。もう一度押してください。")
+        return result
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("考えるのに時間がかかっています。少ししてからもう一度押してください。") from error
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
+def suggest_note_themes(items: list[sqlite3.Row]) -> list[dict[str, object]]:
     """Ask the signed-in Codex CLI for a small set of grounded note ideas.
 
     This deliberately uses the user's existing Codex login, rather than an API key.
@@ -115,36 +151,75 @@ def suggest_note_themes(items: list[sqlite3.Row]) -> str:
 守ること:
 - 単に各記事を言い換えず、複数の記事をつなぐ共通点・対比・本人のメモから切り口を作る。
 - 事実を作らない。根拠にした保存番号を各案に添える。
-- 各案は「タイトル」「何を書くか（2文以内）」「使う保存番号」の順。
+- 各案はタイトル、何を書くか（2文以内）、使う保存番号を返す。
 - ありきたりな案より、本人が自分の経験や考えを足して書ける案を優先する。
 - 断定できない点は、原文を読み直すべき点として短く示す。
 
 保存情報:
 """ + "\n\n".join(sources)
-
-    with tempfile.NamedTemporaryFile(prefix="personal-flow-theme-", suffix=".txt", delete=False) as output:
-        output_path = Path(output.name)
     try:
-        completed = subprocess.run(
-            [
-                "codex", "exec", "--ephemeral", "--skip-git-repo-check",
-                "--output-last-message", str(output_path), prompt,
-            ],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=180,
+        proposal = json.loads(ask_codex(prompt, schema=THEME_SCHEMA))
+        themes = proposal.get("themes", [])
+        if not isinstance(themes, list) or not themes:
+            raise ValueError
+        return themes
+    except (json.JSONDecodeError, ValueError, AttributeError) as error:
+        raise RuntimeError("テーマ案の形を読み取れませんでした。もう一度押してください。") from error
+
+
+def note_flow_rules() -> str:
+    files = [
+        "outputs/Brain_Codex_note1万円/文章ルール.md",
+        "note記事生成ルール.md",
+        "outputs/Brain_Codex_note1万円/10_現在地.md",
+    ]
+    try:
+        return "\n\n".join(
+            f"【{file}】\n{(NOTE_FLOW_ROOT / file).read_text(encoding='utf-8')}"
+            for file in files
         )
-        if completed.returncode != 0 or not output_path.exists():
-            raise RuntimeError("Codexからテーマ案を受け取れませんでした。もう一度押してください。")
-        result = output_path.read_text(encoding="utf-8").strip()
-        if not result:
-            raise RuntimeError("Codexからテーマ案を受け取れませんでした。もう一度押してください。")
-        return result
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("テーマ案づくりに時間がかかっています。少ししてからもう一度押してください。") from error
-    finally:
-        output_path.unlink(missing_ok=True)
+    except OSError as error:
+        raise RuntimeError("note記事化フローのルールを読めませんでした。") from error
+
+
+def make_note_draft(theme: dict[str, object], items: list[sqlite3.Row], memo: str, length: str) -> str:
+    source_numbers = {int(number) for number in theme.get("sources", []) if str(number).isdigit()}
+    source_items = [item for number, item in enumerate(items, start=1) if number in source_numbers]
+    if not source_items:
+        source_items = items[:3]
+    sources = "\n\n".join(
+        f"【保存記事 {number}】\nタイトル: {item['title']}\nURL: {item['url']}\n"
+        f"自分のメモ: {item['note'] or 'なし'}\n本文の抜粋: {item['article'][:5000]}"
+        for number, item in enumerate(source_items, start=1)
+    )
+    prompt = f"""あなたはnote記事化フローの実行役です。以下のルールを守り、Personal Flowから渡されたテーマを記事の下書きにしてください。
+
+【選ばれたテーマ】
+タイトル: {theme.get('title', '')}
+何を書くか: {theme.get('approach', '')}
+
+【本人の追加メモ】
+{memo or 'まだ追加メモはありません。保存記事から分かる事実だけを使い、足りない本人の体験は作らない。'}
+
+【希望文字数】
+{length or '約2,000字'}
+
+【保存記事】
+{sources}
+
+【note記事化フローのルール】
+{note_flow_rules()}
+
+出力順:
+1. タイトル案3つ
+2. 記事の軸（1文）
+3. H2見出し案
+4. 本文初稿
+5. 公開前チェック
+6. ハッシュタグ案
+
+保存記事は参考材料であり、記事の表現や構成をコピーしない。本人の事実・本人の意見・保存記事の事例を混ぜない。"""
+    return ask_codex(prompt, timeout=240)
 
 
 def page(title: str, body: str) -> bytes:
@@ -163,11 +238,11 @@ button,.button{{display:inline-flex;align-items:center;justify-content:center;bo
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
-document.querySelectorAll("form[action='/suggest']").forEach((form) => {{
+document.querySelectorAll("form[action='/suggest'], form[action='/draft']").forEach((form) => {{
   form.addEventListener("submit", () => {{
     const button = form.querySelector("button");
     button.disabled = true;
-    button.textContent = "Youがテーマを考えています…";
+    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : "Youがテーマを考えています…";
   }});
 }});
 </script></body></html>""".encode()
@@ -185,10 +260,45 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urlparse(self.path)
-        if route.path not in {"/", "/themes"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         items = database().execute("SELECT * FROM items ORDER BY id DESC").fetchall()
+        query = parse_qs(route.query)
+        if route.path == "/theme-run":
+            run = self.load_theme_run(query)
+            if not run:
+                self.send_html(page("見つかりません", "<h1>テーマ案が見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
+                return
+            proposal = json.loads(run["proposal_json"])
+            theme_cards = "".join(
+                f"<article class='card theme'><h3>{html.escape(str(theme['title']))}</h3>"
+                f"<p>{html.escape(str(theme['approach']))}</p>"
+                f"<p class='meta'>根拠にした保存記事: {html.escape('・'.join(str(n) for n in theme['sources']))}</p>"
+                f"<form method='get' action='/article-form'><input type='hidden' name='run_id' value='{run['id']}'>"
+                f"<input type='hidden' name='theme' value='{index}'><button type='submit'>このテーマでnote記事にする</button></form></article>"
+                for index, theme in enumerate(proposal["themes"])
+            )
+            body = f"""
+            <header><div><p class='eyebrow'>NOTE THEME PROPOSAL</p><h1>書けそうなテーマ</h1></div><p class='sub'>保存した{len(items)}件をまとめて読んだ結果です。テーマを1つ選ぶと、note記事化フローへ渡します。</p></header>
+            <section class='panel'>{theme_cards}<div class='actions'><a class='button outline' href='/'>保存した情報へ戻る</a></div></section>"""
+            self.send_html(page("noteテーマ", body))
+            return
+        if route.path == "/article-form":
+            run = self.load_theme_run(query)
+            theme = self.load_theme(run, query)
+            if not run or not theme:
+                self.send_html(page("見つかりません", "<h1>選んだテーマが見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
+                return
+            body = f"""
+            <header><div><p class='eyebrow'>NOTE ARTICLE FLOW</p><h1>記事にする前のメモ</h1></div><p class='sub'>テーマと保存記事はすでに渡ります。ここには、あなた自身の出来事や本音だけを足してください。</p></header>
+            <section class='panel'><h2>{html.escape(str(theme['title']))}</h2><p class='hint'>{html.escape(str(theme['approach']))}</p>
+            <form method='post' action='/draft'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{query.get('theme', ['0'])[0]}'>
+            <label>希望文字数</label><input name='length' value='約2,000字'>
+            <label>自分メモ（任意）</label><textarea name='memo' placeholder='実際にあったこと／自分が思ったこと／残したい言葉。箇条書きで大丈夫です。'></textarea>
+            <button class='primary' type='submit'>note記事の下書きを作る</button></form></section>"""
+            self.send_html(page("記事にする", body))
+            return
         cards = "".join(
             f"<article class='card'><div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
             f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
@@ -211,18 +321,59 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 <section class='panel'><div class='section-head'><h2>保存した情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><form method='post' action='/suggest'><button type='submit'>保存した情報からnoteテーマを提案</button></form><a class='button outline' href='/themes'>仮の入口を見る</a><a class='button outline' href='/'>一覧へ戻る</a></div><p class='hint'>保存した記事をまとめてYouが読み、3〜4個のテーマだけ提案します。</p>{theme_cards}{cards}</section></div>"""
         self.send_html(page("情報受け箱", body))
 
+    def load_theme_run(self, query: dict[str, list[str]]) -> sqlite3.Row | None:
+        run_id = query.get("run_id", query.get("id", [""]))[0]
+        if not run_id.isdigit():
+            return None
+        return database().execute("SELECT * FROM theme_runs WHERE id = ?", (run_id,)).fetchone()
+
+    def load_theme(self, run: sqlite3.Row | None, query: dict[str, list[str]]) -> dict[str, object] | None:
+        if not run:
+            return None
+        theme_index = query.get("theme", [""])[0]
+        if not theme_index.isdigit():
+            return None
+        themes = json.loads(run["proposal_json"]).get("themes", [])
+        index = int(theme_index)
+        return themes[index] if 0 <= index < len(themes) else None
+
     def do_POST(self) -> None:
         if self.path == "/suggest":
             items = database().execute("SELECT * FROM items ORDER BY id DESC").fetchall()
             try:
                 proposal = suggest_note_themes(items)
-                body = f"""
-                <header><div><p class='eyebrow'>NOTE THEME PROPOSAL</p><h1>書けそうなテーマ</h1></div><p class='sub'>保存した{len(items)}件をまとめて読んだ結果です。気になった案だけ、原文と自分のメモを見返して育てよう。</p></header>
-                <section class='panel'><div class='summary'>{html.escape(proposal)}</div><div class='actions'><a class='button' href='/'>保存した情報へ戻る</a></div></section>"""
-                self.send_html(page("noteテーマ", body))
+                with database() as connection:
+                    cursor = connection.execute(
+                        "INSERT INTO theme_runs(proposal_json, created_at) VALUES (?, ?)",
+                        (json.dumps({"themes": proposal}, ensure_ascii=False), datetime.now().strftime("%Y-%m-%d %H:%M")),
+                    )
+                self.send_response(303)
+                self.send_header("Location", f"/theme-run?id={cursor.lastrowid}")
+                self.end_headers()
             except (ValueError, RuntimeError) as error:
                 body = f"<h1>テーマを出せませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
                 self.send_html(page("テーマを出せませんでした", body), 400)
+            return
+        if self.path == "/draft":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            run = self.load_theme_run(values)
+            theme = self.load_theme(run, values)
+            if not run or not theme:
+                self.send_html(page("見つかりません", "<h1>選んだテーマが見つかりません</h1>"), 404)
+                return
+            memo = values.get("memo", [""])[0].strip()
+            desired_length = values.get("length", [""])[0].strip()
+            items = database().execute("SELECT * FROM items ORDER BY id DESC").fetchall()
+            try:
+                draft = make_note_draft(theme, items, memo, desired_length)
+                body = f"""
+                <header><div><p class='eyebrow'>NOTE ARTICLE DRAFT</p><h1>note記事の下書き</h1></div><p class='sub'>選んだテーマと保存記事を、note記事化フローへ渡して作った下書きです。</p></header>
+                <section class='panel'><div class='summary'>{html.escape(draft)}</div><div class='actions'><a class='button' href='/'>保存した情報へ戻る</a></div></section>"""
+                self.send_html(page("note記事の下書き", body))
+            except RuntimeError as error:
+                body = f"<h1>下書きを作れませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
+                self.send_html(page("下書きを作れませんでした", body), 400)
             return
         if self.path != "/save":
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
@@ -249,6 +400,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     database().close()
     port = int(os.environ.get("PERSONAL_FLOW_PORT", "8765"))
+    ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("127.0.0.1", port), PersonalFlowHandler)
     print(f"Personal Flow is running at http://127.0.0.1:{port}")
     server.serve_forever()

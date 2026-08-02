@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "themes": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {"type": "string"},
+          "approach": {"type": "string"},
+          "sources": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "minItems": 1
+          }
+        },
+        "required": ["title", "approach", "sources"]
+      }
+    }
+  },
+  "required": ["themes"]
+}
