@@ -372,7 +372,9 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 f"<p><strong>今回は中心にしないこと</strong><br>{html.escape(str(theme.get('left_out', '')))}</p>"
                 f"<p class='meta'>根拠にした保存記事: {html.escape('・'.join(str(n) for n in theme['sources']))}</p>"
                 f"<form method='get' action='/article-form'><input type='hidden' name='run_id' value='{run['id']}'>"
-                f"<input type='hidden' name='theme' value='{index}'><button type='submit'>このテーマでnote記事にする</button></form></article>"
+                f"<input type='hidden' name='theme' value='{index}'><label>このテーマで書きたいこと・入れたくないこと（任意）</label>"
+                f"<textarea name='direction' placeholder='自分の経験／絶対に入れたいこと／今回は触れたくないこと。箇条書きで大丈夫です。'></textarea>"
+                f"<button type='submit'>このテーマでnote記事にする</button></form></article>"
                 for index, theme in enumerate(proposal["themes"])
             )
             body = f"""
@@ -386,10 +388,12 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             if not run or not theme:
                 self.send_html(page("見つかりません", "<h1>選んだテーマが見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
                 return
+            direction = query.get("direction", [""])[0].strip()
+            direction_note = f"<div class='note'><strong>テーマを選ぶ時に書いたこと</strong><br>{html.escape(direction)}</div>" if direction else ""
             body = f"""
             <header><div><p class='eyebrow'>NOTE ARTICLE FLOW</p><h1>記事にする前のメモ</h1></div><p class='sub'>テーマと保存記事はすでに渡ります。ここには、あなた自身の出来事や本音だけを足してください。</p></header>
-            <section class='panel'><h2>{html.escape(str(theme['title']))}</h2><p class='hint'>{html.escape(str(theme['approach']))}</p>
-            <form method='post' action='/draft'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{query.get('theme', ['0'])[0]}'>
+            <section class='panel'><h2>{html.escape(str(theme['title']))}</h2><p class='hint'>{html.escape(str(theme['approach']))}</p>{direction_note}
+            <form method='post' action='/draft'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{query.get('theme', ['0'])[0]}'><input type='hidden' name='direction' value='{html.escape(direction, quote=True)}'>
             <label>希望文字数</label><input name='length' value='約2,000字'>
             <label>自分メモ（任意）</label><textarea name='memo' placeholder='実際にあったこと／自分が思ったこと／残したい言葉。箇条書きで大丈夫です。'></textarea>
             <button class='primary' type='submit'>note記事の下書きを作る</button></form></section>"""
@@ -481,12 +485,14 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 self.send_html(page("見つかりません", "<h1>選んだテーマが見つかりません</h1>"), 404)
                 return
             memo = values.get("memo", [""])[0].strip()
+            direction = values.get("direction", [""])[0].strip()
             desired_length = values.get("length", [""])[0].strip()
             proposal = json.loads(run["proposal_json"])
             selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
             items = selected_flow_items(run["flow_id"], selected_ids)
             try:
-                draft = make_note_draft(theme, items, memo, desired_length)
+                combined_memo = "\n\n".join(part for part in [direction, memo] if part)
+                draft = make_note_draft(theme, items, combined_memo, desired_length)
                 body = f"""
                 <header><div><p class='eyebrow'>NOTE ARTICLE DRAFT</p><h1>note記事の下書き</h1></div><p class='sub'>選んだテーマと保存記事を、note記事化フローへ渡して作った下書きです。</p></header>
                 <section class='panel'><div class='summary'>{html.escape(draft)}</div><div class='actions'><a class='button' href='/'>保存した情報へ戻る</a></div></section>"""
