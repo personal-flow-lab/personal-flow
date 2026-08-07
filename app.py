@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "personal-flow.db"
 NOTE_FLOW_ROOT = Path("/Users/kumagainorihiko/Documents/Codex/2026-06-28/30-note-10-1")
 THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
+CODEX_PATH = os.environ.get("PERSONAL_FLOW_CODEX", str(Path.home() / ".local/bin/codex"))
 
 
 def database() -> sqlite3.Connection:
@@ -171,7 +172,7 @@ def ask_codex(prompt: str, timeout: int = 180, schema: Path | None = None) -> st
     """Use the existing Codex login. No API key is involved."""
     with tempfile.NamedTemporaryFile(prefix="personal-flow-", suffix=".txt", delete=False) as output:
         output_path = Path(output.name)
-    command = ["codex", "exec", "--ephemeral", "--skip-git-repo-check"]
+    command = [CODEX_PATH, "exec", "--ephemeral", "--skip-git-repo-check"]
     if schema:
         command.extend(["--output-schema", str(schema)])
     command.extend(["--output-last-message", str(output_path), prompt])
