@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "personal-flow.db"
-NOTE_FLOW_ROOT = Path("/Users/kumagainorihiko/Documents/Codex/2026-06-28/30-note-10-1")
+NOTE_FLOW_ROOT = ROOT / "note-flow-rules"
 THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
 CODEX_PATH = os.environ.get("PERSONAL_FLOW_CODEX", str(Path.home() / ".local/bin/codex"))
 
@@ -58,6 +58,18 @@ def database() -> sqlite3.Connection:
             status TEXT NOT NULL DEFAULT 'active',
             created_at TEXT NOT NULL,
             closed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS direction_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            theme_run_id INTEGER NOT NULL,
+            theme_index INTEGER NOT NULL,
+            direction_notes TEXT NOT NULL DEFAULT '',
+            result TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
         """
     )
@@ -289,6 +301,42 @@ def make_note_draft(theme: dict[str, object], items: list[sqlite3.Row], memo: st
     return ask_codex(prompt, timeout=240)
 
 
+def refine_note_direction(theme: dict[str, object], items: list[sqlite3.Row], user_notes: str, previous: str = "") -> str:
+    """Develop a chosen theme with the same rules used for note drafting."""
+    sources = "\n\n".join(
+        f"【保存記事 {number}】\nタイトル: {item['title']}\n自分のメモ: {item['note'] or 'なし'}\n"
+        f"本文の抜粋: {item['article'][:3500]}"
+        for number, item in enumerate(items, start=1)
+    )
+    prompt = f"""あなたはnote記事化フローの編集パートナーです。下書きはまだ書かず、記事の方向性を本人と一緒に固めます。
+
+【選んだテーマ】
+タイトル: {theme.get('title', '')}
+何を書くか: {theme.get('approach', '')}
+
+【本人が今書いていること】
+{user_notes or 'まだなし。本人の経験や気持ちは作らない。'}
+
+【前回までに固めた内容】
+{previous or '初回です。'}
+
+【保存記事】
+{sources}
+
+【note記事化フローのルール】
+{note_flow_rules()}
+
+次の順番で、本人が次に考えやすい形にして返す。
+1. 今回の記事の中心（2〜3文）
+2. 入れると記事が本人らしくなる要素
+3. 今回は外した方がよい要素
+4. 次に本人へ聞きたい質問（最大3つ）
+5. 今の時点での見出しのたたき台
+
+事実、本人の意見、保存記事からの読み取りを混ぜない。足りない本人の体験は質問として残す。"""
+    return ask_codex(prompt, timeout=240)
+
+
 def page(title: str, body: str) -> bytes:
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -305,11 +353,11 @@ button,.button{{display:inline-flex;align-items:center;justify-content:center;bo
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
-document.querySelectorAll("form[action='/suggest'], form[action='/draft']").forEach((form) => {{
+document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction']").forEach((form) => {{
   form.addEventListener("submit", () => {{
     const button = form.querySelector("button");
     button.disabled = true;
-    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : "Youがテーマを考えています…";
+    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : "Youがテーマを考えています…";
   }});
 }});
 </script></body></html>""".encode()
@@ -371,10 +419,10 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 f"<p><strong>この組み合わせを選んだ理由</strong><br>{html.escape(str(theme.get('picked', '')))}</p>"
                 f"<p><strong>今回は中心にしないこと</strong><br>{html.escape(str(theme.get('left_out', '')))}</p>"
                 f"<p class='meta'>根拠にした保存記事: {html.escape('・'.join(str(n) for n in theme['sources']))}</p>"
-                f"<form method='get' action='/article-form'><input type='hidden' name='run_id' value='{run['id']}'>"
+                f"<form method='post' action='/direction'><input type='hidden' name='run_id' value='{run['id']}'>"
                 f"<input type='hidden' name='theme' value='{index}'><label>このテーマで書きたいこと・入れたくないこと（任意）</label>"
                 f"<textarea name='direction' placeholder='自分の経験／絶対に入れたいこと／今回は触れたくないこと。箇条書きで大丈夫です。'></textarea>"
-                f"<button type='submit'>このテーマでnote記事にする</button></form></article>"
+                f"<button type='submit'>note記事化フローと方向性を固める</button></form></article>"
                 for index, theme in enumerate(proposal["themes"])
             )
             body = f"""
@@ -389,6 +437,9 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 self.send_html(page("見つかりません", "<h1>選んだテーマが見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
                 return
             direction = query.get("direction", [""])[0].strip()
+            direction_run = self.load_direction_run(query)
+            if direction_run:
+                direction = "\n\n".join(part for part in [direction, direction_run["result"]] if part)
             direction_note = f"<div class='note'><strong>テーマを選ぶ時に書いたこと</strong><br>{html.escape(direction)}</div>" if direction else ""
             body = f"""
             <header><div><p class='eyebrow'>NOTE ARTICLE FLOW</p><h1>記事にする前のメモ</h1></div><p class='sub'>テーマと保存記事はすでに渡ります。ここには、あなた自身の出来事や本音だけを足してください。</p></header>
@@ -437,6 +488,12 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         index = int(theme_index)
         return themes[index] if 0 <= index < len(themes) else None
 
+    def load_direction_run(self, query: dict[str, list[str]]) -> sqlite3.Row | None:
+        direction_id = query.get("direction_run_id", [""])[0]
+        if not direction_id.isdigit():
+            return None
+        return database().execute("SELECT * FROM direction_runs WHERE id = ?", (direction_id,)).fetchone()
+
     def do_POST(self) -> None:
         if self.path == "/finish-action":
             length = int(self.headers.get("Content-Length", "0"))
@@ -475,6 +532,44 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             except (ValueError, RuntimeError) as error:
                 body = f"<h1>テーマを出せませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
                 self.send_html(page("テーマを出せませんでした", body), 400)
+            return
+        if self.path == "/direction":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            direction_run = self.load_direction_run(values)
+            run = self.load_theme_run(values) if not direction_run else database().execute(
+                "SELECT * FROM theme_runs WHERE id = ?", (direction_run["theme_run_id"],)
+            ).fetchone()
+            theme_index = values.get("theme", [str(direction_run["theme_index"]) if direction_run else ""])[0]
+            theme = self.load_theme(run, {"theme": [theme_index]})
+            if not run or not theme or not theme_index.isdigit():
+                self.send_html(page("見つかりません", "<h1>選んだテーマが見つかりません</h1>"), 404)
+                return
+            proposal = json.loads(run["proposal_json"])
+            selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
+            items = selected_flow_items(run["flow_id"], selected_ids)
+            addition = values.get("direction", [""])[0].strip()
+            prior_notes = direction_run["direction_notes"] if direction_run else ""
+            combined_notes = "\n\n".join(part for part in [prior_notes, addition] if part)
+            previous = direction_run["result"] if direction_run else ""
+            try:
+                result = refine_note_direction(theme, items, combined_notes, previous)
+                with database() as connection:
+                    cursor = connection.execute(
+                        "INSERT INTO direction_runs(theme_run_id, theme_index, direction_notes, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (run["id"], int(theme_index), combined_notes, result, datetime.now().strftime("%Y-%m-%d %H:%M")),
+                    )
+                body = f"""
+                <header><div><p class='eyebrow'>DIRECTION WITH NOTE FLOW</p><h1>記事の方向性を固める</h1></div><p class='sub'>note記事化フローのルールと、選んだ保存記事を使って整理した結果です。</p></header>
+                <section class='panel'><h2>{html.escape(str(theme['title']))}</h2><div class='summary'>{html.escape(result)}</div>
+                <form method='post' action='/direction'><input type='hidden' name='direction_run_id' value='{cursor.lastrowid}'><input type='hidden' name='theme' value='{theme_index}'>
+                <label>追加で伝えたいこと（任意）</label><textarea name='direction' placeholder='質問への答え／自分の経験／残したい言葉。もう一度整理したい時だけ書いてください。'></textarea>
+                <div class='actions'><button type='submit'>追加の思いを入れて、もう一度方向性を固める</button></div></form>
+                <form method='get' action='/article-form'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{theme_index}'><input type='hidden' name='direction_run_id' value='{cursor.lastrowid}'><div class='actions'><button class='outline' type='submit'>この方向でnote記事の下書きを作る</button></div></form></section>"""
+                self.send_html(page("記事の方向性", body))
+            except RuntimeError as error:
+                body = f"<h1>方向性を固められませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
+                self.send_html(page("方向性を固められませんでした", body), 400)
             return
         if self.path == "/draft":
             length = int(self.headers.get("Content-Length", "0"))
