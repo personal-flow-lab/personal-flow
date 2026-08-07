@@ -192,7 +192,7 @@ def ask_codex(prompt: str, timeout: int = 180, schema: Path | None = None) -> st
         output_path.unlink(missing_ok=True)
 
 
-def suggest_note_themes(items: list[sqlite3.Row]) -> list[dict[str, object]]:
+def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[dict[str, object]]:
     """Ask the signed-in Codex CLI for a small set of grounded note ideas.
 
     This deliberately uses the user's existing Codex login, rather than an API key.
@@ -217,12 +217,13 @@ def suggest_note_themes(items: list[sqlite3.Row]) -> list[dict[str, object]]:
 守ること:
 - 単に各記事を言い換えず、複数の記事をつなぐ共通点・対比・本人のメモから切り口を作る。
 - 事実を作らない。根拠にした保存番号を各案に添える。
-- 各案はタイトル、何を書くか（2文以内）、使う保存番号を返す。
+- 各案はタイトル、何を書くか（4〜6文）、なぜこの情報を組み合わせたか、今回はあえて中心にしない情報、使う保存番号を返す。
+- 「何を書くか」では、記事の出だし・中心の問い・本人が足すとよい経験まで分かるように書く。
 - ありきたりな案より、本人が自分の経験や考えを足して書ける案を優先する。
 - 断定できない点は、原文を読み直すべき点として短く示す。
 
-保存情報:
-""" + "\n\n".join(sources)
+【今回の記事で入れたい本人の思い】
+""" + (user_angle or "まだ指定なし。保存記事から分かる事実を優先し、本人の経験や気持ちは作らない。") + "\n\n保存情報:\n" + "\n\n".join(sources)
     try:
         proposal = json.loads(ask_codex(prompt, schema=THEME_SCHEMA))
         themes = proposal.get("themes", [])
@@ -352,7 +353,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             ) or "<div class='empty'>まず情報を保存してください。</div>"
             body = f"""
             <header><div><p class='eyebrow'>CHOOSE SOURCES</p><h1>テーマに使う情報を選ぶ</h1></div><p class='sub'>今回の記事に使いたい情報だけを選びます。1件でも、複数の記事を組み合わせても大丈夫です。</p></header>
-            <form method='post' action='/suggest'><section class='panel'>{source_cards}<div class='actions'><button type='submit'>選んだ情報からnoteテーマを提案</button><a class='button outline' href='/'>戻る</a></div></section></form>"""
+            <form method='post' action='/suggest'><section class='panel'>{source_cards}<label>今回の記事で入れたい自分の思い（任意）</label><textarea name='user_angle' placeholder='たとえば、自分が実際に困ったこと／この記事で言いたいこと／絶対に残したい感情。箇条書きで大丈夫です。'></textarea><div class='actions'><button type='submit'>選んだ情報からnoteテーマを提案</button><a class='button outline' href='/'>戻る</a></div></section></form>"""
             self.send_html(page("テーマに使う情報を選ぶ", body))
             return
         if route.path == "/theme-run":
@@ -361,17 +362,22 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 self.send_html(page("見つかりません", "<h1>テーマ案が見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
                 return
             proposal = json.loads(run["proposal_json"])
+            selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
+            source_count = len(selected_flow_items(run["flow_id"], selected_ids))
+            user_angle = str(proposal.get("user_angle", "")).strip()
             theme_cards = "".join(
                 f"<article class='card theme'><h3>{html.escape(str(theme['title']))}</h3>"
                 f"<p>{html.escape(str(theme['approach']))}</p>"
+                f"<p><strong>この組み合わせを選んだ理由</strong><br>{html.escape(str(theme.get('picked', '')))}</p>"
+                f"<p><strong>今回は中心にしないこと</strong><br>{html.escape(str(theme.get('left_out', '')))}</p>"
                 f"<p class='meta'>根拠にした保存記事: {html.escape('・'.join(str(n) for n in theme['sources']))}</p>"
                 f"<form method='get' action='/article-form'><input type='hidden' name='run_id' value='{run['id']}'>"
                 f"<input type='hidden' name='theme' value='{index}'><button type='submit'>このテーマでnote記事にする</button></form></article>"
                 for index, theme in enumerate(proposal["themes"])
             )
             body = f"""
-            <header><div><p class='eyebrow'>NOTE THEME PROPOSAL</p><h1>書けそうなテーマ</h1></div><p class='sub'>今の記事の箱にある{len(items)}件をまとめて読んだ結果です。テーマを1つ選ぶと、note記事化フローへ渡します。</p></header>
-            <section class='panel'>{theme_cards}<div class='actions'><a class='button outline' href='/'>保存した情報へ戻る</a></div></section>"""
+            <header><div><p class='eyebrow'>NOTE THEME PROPOSAL</p><h1>書けそうなテーマ</h1></div><p class='sub'>選んだ{source_count}件をまとめて読んだ結果です。テーマを1つ選ぶと、note記事化フローへ渡します。</p></header>
+            <section class='panel'>{f"<div class='note'><strong>今回入れたい自分の思い</strong><br>{html.escape(user_angle)}</div>" if user_angle else ""}{theme_cards}<div class='actions'><a class='button outline' href='/'>保存した情報へ戻る</a></div></section>"""
             self.send_html(page("noteテーマ", body))
             return
         if route.path == "/article-form":
@@ -442,18 +448,19 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             values = parse_qs(self.rfile.read(length).decode())
             flow = active_flow()
             selected_ids = values.get("item_ids", [])
+            user_angle = values.get("user_angle", [""])[0].strip()
             if not selected_ids:
                 body = "<h1>情報が選ばれていません</h1><p class='message'>テーマに使う情報を、少なくとも1件チェックしてください。</p><p><a href='/choose-sources'>情報を選ぶ画面へ戻る</a></p>"
                 self.send_html(page("情報を選んでください", body), 400)
                 return
             items = selected_flow_items(flow["id"], selected_ids)
             try:
-                proposal = suggest_note_themes(items)
+                proposal = suggest_note_themes(items, user_angle)
                 with database() as connection:
                     cursor = connection.execute(
                         "INSERT INTO theme_runs(proposal_json, flow_id, created_at) VALUES (?, ?, ?)",
                         (
-                            json.dumps({"themes": proposal, "item_ids": [item["id"] for item in items]}, ensure_ascii=False),
+                            json.dumps({"themes": proposal, "item_ids": [item["id"] for item in items], "user_angle": user_angle}, ensure_ascii=False),
                             flow["id"],
                             datetime.now().strftime("%Y-%m-%d %H:%M"),
                         ),

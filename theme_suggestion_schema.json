@@ -12,13 +12,15 @@
         "properties": {
           "title": {"type": "string"},
           "approach": {"type": "string"},
+          "picked": {"type": "string"},
+          "left_out": {"type": "string"},
           "sources": {
             "type": "array",
             "items": {"type": "integer"},
             "minItems": 1
           }
         },
-        "required": ["title", "approach", "sources"]
+        "required": ["title", "approach", "picked", "left_out", "sources"]
       }
     }
   },
