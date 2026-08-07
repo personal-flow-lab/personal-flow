@@ -44,14 +44,79 @@ def database() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS theme_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             proposal_json TEXT NOT NULL,
+            flow_id INTEGER,
             created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            closed_at TEXT
         )
         """
     )
     existing = {row[1] for row in connection.execute("PRAGMA table_info(items)")}
     if "article" not in existing:
         connection.execute("ALTER TABLE items ADD COLUMN article TEXT NOT NULL DEFAULT ''")
+    if "flow_id" not in existing:
+        connection.execute("ALTER TABLE items ADD COLUMN flow_id INTEGER")
+    theme_columns = {row[1] for row in connection.execute("PRAGMA table_info(theme_runs)")}
+    if "flow_id" not in theme_columns:
+        connection.execute("ALTER TABLE theme_runs ADD COLUMN flow_id INTEGER")
+    active = connection.execute("SELECT id FROM flows WHERE status = 'active' ORDER BY id DESC LIMIT 1").fetchone()
+    if not active:
+        cursor = connection.execute(
+            "INSERT INTO flows(name, status, created_at) VALUES (?, 'active', ?)",
+            ("今回の記事", datetime.now().strftime("%Y-%m-%d %H:%M")),
+        )
+        active_id = cursor.lastrowid
+        connection.execute("UPDATE items SET flow_id = ? WHERE flow_id IS NULL", (active_id,))
+        connection.execute("UPDATE theme_runs SET flow_id = ? WHERE flow_id IS NULL", (active_id,))
+    connection.commit()
     return connection
+
+
+def active_flow() -> sqlite3.Row:
+    flow = database().execute("SELECT * FROM flows WHERE status = 'active' ORDER BY id DESC LIMIT 1").fetchone()
+    if not flow:
+        raise RuntimeError("今の記事の箱を用意できませんでした。")
+    return flow
+
+
+def flow_items(flow_id: int) -> list[sqlite3.Row]:
+    return database().execute("SELECT * FROM items WHERE flow_id = ? ORDER BY id DESC", (flow_id,)).fetchall()
+
+
+def selected_flow_items(flow_id: int, item_ids: list[str]) -> list[sqlite3.Row]:
+    items = flow_items(flow_id)
+    selected = {int(item_id) for item_id in item_ids if item_id.isdigit()}
+    return [item for item in items if item["id"] in selected] if selected else items
+
+
+def start_next_flow(previous: sqlite3.Row, keep: bool) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with database() as connection:
+        if keep:
+            connection.execute(
+                "UPDATE flows SET name = ?, status = 'saved', closed_at = ? WHERE id = ?",
+                (f"保存した情報 {now}", now, previous["id"]),
+            )
+        else:
+            connection.execute("DELETE FROM theme_runs WHERE flow_id = ?", (previous["id"],))
+            connection.execute("DELETE FROM items WHERE flow_id = ?", (previous["id"],))
+            connection.execute(
+                "UPDATE flows SET status = 'discarded', closed_at = ? WHERE id = ?",
+                (now, previous["id"]),
+            )
+        connection.execute(
+            "INSERT INTO flows(name, status, created_at) VALUES (?, 'active', ?)",
+            ("今回の記事", now),
+        )
 
 
 def extract_article(url: str) -> tuple[str, str]:
@@ -132,8 +197,8 @@ def suggest_note_themes(items: list[sqlite3.Row]) -> list[dict[str, object]]:
     This deliberately uses the user's existing Codex login, rather than an API key.
     """
     selected = items[:8]
-    if len(selected) < 2:
-        raise ValueError("テーマを出すには、まず記事を2件以上保存してください。")
+    if not selected:
+        raise ValueError("テーマに使う情報を、少なくとも1件選んでください。")
 
     sources = []
     for number, item in enumerate(selected, start=1):
@@ -235,7 +300,7 @@ h1{{font-size:42px;letter-spacing:-.05em;margin:0}} h2{{font-size:18px;margin:0 
 label{{display:block;font-weight:750;font-size:13px;margin-top:15px}} input,textarea{{width:100%;font:inherit;border:1px solid #cac7bd;border-radius:9px;padding:12px;background:#fff;margin-top:6px}} textarea{{min-height:100px;resize:vertical}}
 button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button.primary{{background:var(--green);width:100%;margin-top:18px}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
 .section-head{{display:flex;justify-content:space-between;align-items:center;gap:12px}} .count{{font-size:12px;color:var(--muted);background:#edebe5;border-radius:99px;padding:3px 8px}} .meta{{font-size:12px;color:var(--muted)}} .summary{{white-space:pre-wrap;font-size:14px;margin:12px 0}} .note{{background:#f2f5ef;border-radius:8px;padding:10px 12px;font-size:13px}} a{{color:var(--green)}} .empty{{color:var(--muted);padding:24px 0;text-align:center}}
-.actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}}
+.actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
 document.querySelectorAll("form[action='/suggest'], form[action='/draft']").forEach((form) => {{
@@ -260,11 +325,35 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urlparse(self.path)
-        if route.path not in {"/", "/themes", "/theme-run", "/article-form"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
-        items = database().execute("SELECT * FROM items ORDER BY id DESC").fetchall()
+        flow = active_flow()
+        items = flow_items(flow["id"])
         query = parse_qs(route.query)
+        if route.path == "/finish":
+            body = f"""
+            <header><div><p class='eyebrow'>FINISH THIS ARTICLE</p><h1>今回の記事を終える</h1></div><p class='sub'>今の{len(items)}件を、次の記事の材料に混ぜないための区切りです。</p></header>
+            <section class='panel'><h2>この{len(items)}件をどうしますか？</h2>
+            <p class='hint'>「保存」はあとで見返せる履歴にします。次の記事のテーマ提案には入りません。「消す」は今回の情報だけを削除します。</p>
+            <div class='actions'><form method='post' action='/finish-action'><input type='hidden' name='keep' value='yes'><button type='submit'>保存して、新しい記事を始める</button></form>
+            <form method='post' action='/finish-action'><input type='hidden' name='keep' value='no'><button class='outline' type='submit'>保存せずに、新しい記事を始める</button></form>
+            <a class='button outline' href='/'>まだ続ける</a></div></section>"""
+            self.send_html(page("今回の記事を終える", body))
+            return
+        if route.path == "/choose-sources":
+            source_cards = "".join(
+                f"<article class='card'><label class='pick'><input type='checkbox' name='item_ids' value='{item['id']}'>この情報をテーマに使う</label>"
+                f"<div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
+                f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
+                f"<div class='summary'>{html.escape(item['summary'])}</div></article>"
+                for item in items
+            ) or "<div class='empty'>まず情報を保存してください。</div>"
+            body = f"""
+            <header><div><p class='eyebrow'>CHOOSE SOURCES</p><h1>テーマに使う情報を選ぶ</h1></div><p class='sub'>今回の記事に使いたい情報だけを選びます。1件でも、複数の記事を組み合わせても大丈夫です。</p></header>
+            <form method='post' action='/suggest'><section class='panel'>{source_cards}<div class='actions'><button type='submit'>選んだ情報からnoteテーマを提案</button><a class='button outline' href='/'>戻る</a></div></section></form>"""
+            self.send_html(page("テーマに使う情報を選ぶ", body))
+            return
         if route.path == "/theme-run":
             run = self.load_theme_run(query)
             if not run:
@@ -280,7 +369,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 for index, theme in enumerate(proposal["themes"])
             )
             body = f"""
-            <header><div><p class='eyebrow'>NOTE THEME PROPOSAL</p><h1>書けそうなテーマ</h1></div><p class='sub'>保存した{len(items)}件をまとめて読んだ結果です。テーマを1つ選ぶと、note記事化フローへ渡します。</p></header>
+            <header><div><p class='eyebrow'>NOTE THEME PROPOSAL</p><h1>書けそうなテーマ</h1></div><p class='sub'>今の記事の箱にある{len(items)}件をまとめて読んだ結果です。テーマを1つ選ぶと、note記事化フローへ渡します。</p></header>
             <section class='panel'>{theme_cards}<div class='actions'><a class='button outline' href='/'>保存した情報へ戻る</a></div></section>"""
             self.send_html(page("noteテーマ", body))
             return
@@ -318,7 +407,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 <div class='grid'><section class='panel'><h2>情報を入れる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
-<section class='panel'><div class='section-head'><h2>保存した情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><form method='post' action='/suggest'><button type='submit'>保存した情報からnoteテーマを提案</button></form><a class='button outline' href='/themes'>仮の入口を見る</a><a class='button outline' href='/'>一覧へ戻る</a></div><p class='hint'>保存した記事をまとめてYouが読み、3〜4個のテーマだけ提案します。</p>{theme_cards}{cards}</section></div>"""
+<section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
         self.send_html(page("情報受け箱", body))
 
     def load_theme_run(self, query: dict[str, list[str]]) -> sqlite3.Row | None:
@@ -338,14 +427,35 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         return themes[index] if 0 <= index < len(themes) else None
 
     def do_POST(self) -> None:
+        if self.path == "/finish-action":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            keep = values.get("keep", [""])[0] == "yes"
+            start_next_flow(active_flow(), keep)
+            message = "保存して、新しい記事の箱を始めました。" if keep else "今回の情報を消して、新しい記事の箱を始めました。"
+            body = f"<h1>新しい記事を始められます</h1><p class='message'>{message}</p><p><a class='button' href='/'>空の箱を開く</a></p>"
+            self.send_html(page("新しい記事を始める", body))
+            return
         if self.path == "/suggest":
-            items = database().execute("SELECT * FROM items ORDER BY id DESC").fetchall()
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            flow = active_flow()
+            selected_ids = values.get("item_ids", [])
+            if not selected_ids:
+                body = "<h1>情報が選ばれていません</h1><p class='message'>テーマに使う情報を、少なくとも1件チェックしてください。</p><p><a href='/choose-sources'>情報を選ぶ画面へ戻る</a></p>"
+                self.send_html(page("情報を選んでください", body), 400)
+                return
+            items = selected_flow_items(flow["id"], selected_ids)
             try:
                 proposal = suggest_note_themes(items)
                 with database() as connection:
                     cursor = connection.execute(
-                        "INSERT INTO theme_runs(proposal_json, created_at) VALUES (?, ?)",
-                        (json.dumps({"themes": proposal}, ensure_ascii=False), datetime.now().strftime("%Y-%m-%d %H:%M")),
+                        "INSERT INTO theme_runs(proposal_json, flow_id, created_at) VALUES (?, ?, ?)",
+                        (
+                            json.dumps({"themes": proposal, "item_ids": [item["id"] for item in items]}, ensure_ascii=False),
+                            flow["id"],
+                            datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        ),
                     )
                 self.send_response(303)
                 self.send_header("Location", f"/theme-run?id={cursor.lastrowid}")
@@ -364,7 +474,9 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             memo = values.get("memo", [""])[0].strip()
             desired_length = values.get("length", [""])[0].strip()
-            items = database().execute("SELECT * FROM items ORDER BY id DESC").fetchall()
+            proposal = json.loads(run["proposal_json"])
+            selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
+            items = selected_flow_items(run["flow_id"], selected_ids)
             try:
                 draft = make_note_draft(theme, items, memo, desired_length)
                 body = f"""
@@ -384,10 +496,11 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         note = values.get("note", [""])[0].strip()
         try:
             title, article = extract_article(url)
+            flow = active_flow()
             with database() as connection:
                 connection.execute(
-                    "INSERT INTO items(url, title, article, summary, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (url, title, article, make_summary(article), note, datetime.now().strftime("%Y-%m-%d %H:%M")),
+                    "INSERT INTO items(url, title, article, summary, note, created_at, flow_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (url, title, article, make_summary(article), note, datetime.now().strftime("%Y-%m-%d %H:%M"), flow["id"]),
                 )
             self.send_response(303)
             self.send_header("Location", "/")
