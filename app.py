@@ -22,6 +22,7 @@ DB_PATH = ROOT / "personal-flow.db"
 NOTE_FLOW_ROOT = ROOT / "note-flow-rules"
 THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
 CODEX_PATH = os.environ.get("PERSONAL_FLOW_CODEX", str(Path.home() / ".local/bin/codex"))
+DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
 
 
 def database() -> sqlite3.Connection:
@@ -73,6 +74,15 @@ def database() -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     existing = {row[1] for row in connection.execute("PRAGMA table_info(items)")}
     if "article" not in existing:
         connection.execute("ALTER TABLE items ADD COLUMN article TEXT NOT NULL DEFAULT ''")
@@ -99,6 +109,20 @@ def active_flow() -> sqlite3.Row:
     if not flow:
         raise RuntimeError("今の記事の箱を用意できませんでした。")
     return flow
+
+
+def user_context() -> str:
+    row = database().execute("SELECT value FROM app_settings WHERE key = 'user_context'").fetchone()
+    return row["value"].strip() if row else ""
+
+
+def save_user_context(value: str) -> None:
+    with database() as connection:
+        connection.execute(
+            "INSERT INTO app_settings(key, value, updated_at) VALUES ('user_context', ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (value.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")),
+        )
 
 
 def flow_items(flow_id: int) -> list[sqlite3.Row]:
@@ -155,6 +179,58 @@ def extract_article(url: str) -> tuple[str, str]:
     if len(text) < 80:
         raise ValueError("記事本文を十分に取得できませんでした。ログインが必要なページかもしれません。")
     return title, text
+
+
+def note_profile_articles(profile_url: str) -> list[str]:
+    """Collect public note article links from one creator page, without using an account."""
+    parsed = urlparse(profile_url)
+    if parsed.netloc != "note.com" or not parsed.path.strip("/"):
+        raise ValueError("noteのプロフィールURLを入れてください。")
+    creator = parsed.path.strip("/").split("/")[0]
+    request = urllib.request.Request(profile_url, headers={"User-Agent": "PersonalFlow/0.3 (private local tool)"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        raw = response.read(3_000_000).decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+    found = re.findall(rf'(?:https://note\\.com)?/{re.escape(creator)}/n/(n[a-z0-9]+)', raw, re.I)
+    links: list[str] = []
+    for note_id in found:
+        link = f"https://note.com/{creator}/n/{note_id}"
+        if link not in links:
+            links.append(link)
+    if not links:
+        raise ValueError("note記事を取得できませんでした。公開されているプロフィールページか確認してください。")
+    return links[:40]
+
+
+def build_user_context(profile_url: str) -> str:
+    links = note_profile_articles(profile_url)
+    material: list[str] = []
+    for number, link in enumerate(links, start=1):
+        try:
+            title, article = extract_article(link)
+            material.append(f"【記事 {number}】{title}\n{article[:1800]}")
+        except (ValueError, OSError, urllib.error.URLError):
+            continue
+    if not material:
+        raise RuntimeError("記事本文を取得できませんでした。")
+    prompt = """あなたは、個人の公開note記事を読み、その人専用の『Personal Flowの土台』を作る編集者です。
+以下は本人が書いた記事です。記事そのものを要約・コピーするのではなく、今後の記事の素材選びに使える、短い判断基準を作ってください。
+
+必ず守ること:
+- 書かれていない経歴、感情、主張を作らない。
+- 本人の意見と、記事タイトル・記述からの推測を混ぜない。
+- 過去の自分を固定しない。新しいテーマも選べる余白を残す。
+- 900〜1,400字程度の日本語に圧縮する。
+
+出力の形:
+1. 本人について確実に言えること
+2. 繰り返し出る関心・問い
+3. 反応しやすい情報の特徴
+4. noteで生きる材料（経験・視点）
+5. 避けたいこと・注意点
+6. Personal Flowへの短い指示
+
+公開note記事:\n""" + "\n\n".join(material)
+    return ask_codex(prompt, timeout=300)
 
 
 def make_summary(text: str) -> str:
@@ -235,7 +311,7 @@ def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[
 - 断定できない点は、原文を読み直すべき点として短く示す。
 
 【今回の記事で入れたい本人の思い】
-""" + (user_angle or "まだ指定なし。保存記事から分かる事実を優先し、本人の経験や気持ちは作らない。") + "\n\n保存情報:\n" + "\n\n".join(sources)
+""" + (user_angle or "まだ指定なし。保存記事から分かる事実を優先し、本人の経験や気持ちは作らない。") + "\n\n【本人のPersonal Flowの土台】\n" + (user_context() or "まだ土台はありません。保存記事だけを根拠にする。") + "\n\n保存情報:\n" + "\n\n".join(sources)
     try:
         proposal = json.loads(ask_codex(prompt, schema=THEME_SCHEMA))
         themes = proposal.get("themes", [])
@@ -289,6 +365,9 @@ def make_note_draft(theme: dict[str, object], items: list[sqlite3.Row], memo: st
 【note記事化フローのルール】
 {note_flow_rules()}
 
+【本人のPersonal Flowの土台】
+{user_context() or 'まだ土台はありません。保存記事と本人メモだけを根拠にする。'}
+
 出力順:
 1. タイトル案3つ
 2. 記事の軸（1文）
@@ -325,6 +404,9 @@ def refine_note_direction(theme: dict[str, object], items: list[sqlite3.Row], us
 
 【note記事化フローのルール】
 {note_flow_rules()}
+
+【本人のPersonal Flowの土台】
+{user_context() or 'まだ土台はありません。保存記事と本人メモだけを根拠にする。'}
 
 次の順番で、本人が次に考えやすい形にして返す。
 1. 今回の記事の中心（2〜3文）
@@ -375,7 +457,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urlparse(self.path)
-        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         flow = active_flow()
@@ -390,6 +472,15 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             <form method='post' action='/finish-action'><input type='hidden' name='keep' value='no'><button class='outline' type='submit'>保存せずに、新しい記事を始める</button></form>
             <a class='button outline' href='/'>まだ続ける</a></div></section>"""
             self.send_html(page("今回の記事を終える", body))
+            return
+        if route.path == "/context":
+            context = user_context()
+            body = f"""
+            <header><div><p class='eyebrow'>YOUR PRIVATE BASE</p><h1>自分の土台を見直す</h1></div><p class='sub'>普段は画面に出ません。記事を選ぶ時にだけ、あなたらしい切り口を考える参考として使います。</p></header>
+            <section class='panel'><h2>note記事から土台を作る</h2><p class='hint'>公開noteの記事を読み、あなたの考え方・関心・書き方を圧縮します。原文はこのMacの外へ保存しません。</p>
+            <form method='post' action='/build-context'><label>noteプロフィールURL</label><input name='profile_url' value='{DEFAULT_NOTE_PROFILE}' required><button class='primary' type='submit'>note記事から土台を作り直す</button></form></section>
+            <section class='panel'><h2>今の土台</h2><form method='post' action='/context-save'><textarea name='context' placeholder='まだ作られていません。上のボタンから作れます。'>{html.escape(context)}</textarea><div class='actions'><button type='submit'>この内容で保存する</button><a class='button outline' href='/'>戻る</a></div></form></section>"""
+            self.send_html(page("自分の土台", body))
             return
         if route.path == "/choose-sources":
             source_cards = "".join(
@@ -420,8 +511,8 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 f"<p><strong>今回は中心にしないこと</strong><br>{html.escape(str(theme.get('left_out', '')))}</p>"
                 f"<p class='meta'>根拠にした保存記事: {html.escape('・'.join(str(n) for n in theme['sources']))}</p>"
                 f"<form method='post' action='/direction'><input type='hidden' name='run_id' value='{run['id']}'>"
-                f"<input type='hidden' name='theme' value='{index}'><label>このテーマで書きたいこと・入れたくないこと（任意）</label>"
-                f"<textarea name='direction' placeholder='自分の経験／絶対に入れたいこと／今回は触れたくないこと。箇条書きで大丈夫です。'></textarea>"
+                f"<input type='hidden' name='theme' value='{index}'><label>このテーマで入れたいこと（任意）</label>"
+                f"<textarea name='direction' placeholder='自分の経験／絶対に残したい言葉／今回の記事で言いたいこと。箇条書きで大丈夫です。'></textarea>"
                 f"<button type='submit'>note記事化フローと方向性を固める</button></form></article>"
                 for index, theme in enumerate(proposal["themes"])
             )
@@ -469,7 +560,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 <div class='grid'><section class='panel'><h2>情報を入れる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
-<section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
+<section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/context'>自分の土台を見直す</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
         self.send_html(page("情報受け箱", body))
 
     def load_theme_run(self, query: dict[str, list[str]]) -> sqlite3.Row | None:
@@ -495,6 +586,27 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         return database().execute("SELECT * FROM direction_runs WHERE id = ?", (direction_id,)).fetchone()
 
     def do_POST(self) -> None:
+        if self.path == "/context-save":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            save_user_context(values.get("context", [""])[0])
+            self.send_response(303)
+            self.send_header("Location", "/context")
+            self.end_headers()
+            return
+        if self.path == "/build-context":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            profile_url = values.get("profile_url", [""])[0].strip()
+            try:
+                context = build_user_context(profile_url)
+                save_user_context(context)
+                body = f"<h1>自分の土台を作りました</h1><p class='message'>普段は裏で使われます。必要な時だけ、ここで直せます。</p><section class='panel'><div class='summary'>{html.escape(context)}</div><p><a class='button' href='/'>Personal Flowへ戻る</a></p></section>"
+                self.send_html(page("自分の土台", body))
+            except (ValueError, RuntimeError, OSError, urllib.error.URLError) as error:
+                body = f"<h1>土台を作れませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/context'>土台の画面へ戻る</a></p>"
+                self.send_html(page("土台を作れませんでした", body), 400)
+            return
         if self.path == "/finish-action":
             length = int(self.headers.get("Content-Length", "0"))
             values = parse_qs(self.rfile.read(length).decode())
