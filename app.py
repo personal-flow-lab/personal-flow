@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import cgi
 import html
 import json
 import os
@@ -21,8 +22,15 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "personal-flow.db"
 NOTE_FLOW_ROOT = ROOT / "note-flow-rules"
 THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
+X_POST_SCHEMA = ROOT / "x_post_schema.json"
 CODEX_PATH = os.environ.get("PERSONAL_FLOW_CODEX", str(Path.home() / ".local/bin/codex"))
 DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
+
+X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り始めた途中にいる人の口調にする。
+- できる人の解説ではなく、分からない側から実際に試した記録として書く。
+- 専門家ぶった断定、煽り、過剰な成果アピールをしない。
+- 材料にない経験、数字、成果、感情を足さない。
+- 読む人に命令せず、自分が考えたこと・次に試したいことへ自然に戻す。"""
 
 
 def database() -> sqlite3.Connection:
@@ -256,11 +264,18 @@ def themes(items: list[sqlite3.Row]) -> list[tuple[str, str]]:
     ]
 
 
-def ask_codex(prompt: str, timeout: int = 180, schema: Path | None = None) -> str:
+def ask_codex(
+    prompt: str,
+    timeout: int = 180,
+    schema: Path | None = None,
+    images: list[Path] | None = None,
+) -> str:
     """Use the existing Codex login. No API key is involved."""
     with tempfile.NamedTemporaryFile(prefix="personal-flow-", suffix=".txt", delete=False) as output:
         output_path = Path(output.name)
     command = [CODEX_PATH, "exec", "--ephemeral", "--skip-git-repo-check"]
+    for image in images or []:
+        command.extend(["--image", str(image)])
     if schema:
         command.extend(["--output-schema", str(schema)])
     command.extend(["--output-last-message", str(output_path), prompt])
@@ -419,6 +434,90 @@ def refine_note_direction(theme: dict[str, object], items: list[sqlite3.Row], us
     return ask_codex(prompt, timeout=240)
 
 
+def make_x_posts(material: str, images: list[Path] | None = None) -> dict[str, object]:
+    """Create copy-ready X post text locally, using the signed-in Codex account only."""
+    prompt = f"""あなたは、本人が自分でXへ貼り付ける投稿文を整える編集パートナーです。
+Xへの投稿、ログイン、予約、外部API接続は一切しません。
+
+【本人らしさの基準】
+{X_POST_STYLE}
+
+【Personal Flowの土台】
+{user_context() or 'まだ土台はありません。今回の材料だけを根拠にする。'}
+
+【今回の材料】
+{material}
+
+画像が添付されている場合は、画像内の文章・見出しを今回の材料として読んでよい。ただし、見えない内容を補わない。
+
+次のルールで、X投稿案を返す。
+- 内容が一つなら single、背景を省くと本人らしさが消える時だけ thread を選ぶ。
+- single は1本、thread は2〜3本。各投稿は280字以内。
+- 本文に投稿番号、見出し、絵文字、ハッシュタグ、URLは入れない。
+- 最初の投稿だけでも、何の話かと本人の結論が分かるようにする。
+- 材料が薄い時は、無理に立派な投稿にせず、分かる範囲だけで短く書く。
+- JSONだけを返す。"""
+    try:
+        result = json.loads(ask_codex(prompt, timeout=180, schema=X_POST_SCHEMA, images=images))
+        posts = result.get("posts", [])
+        if not isinstance(posts, list) or not posts or any(len(str(post)) > 280 for post in posts):
+            raise ValueError
+        return result
+    except (json.JSONDecodeError, ValueError, AttributeError) as error:
+        raise RuntimeError("X投稿文の形を読み取れませんでした。もう一度押してください。") from error
+
+
+def x_material_from_items(items: list[sqlite3.Row]) -> str:
+    if not items:
+        raise ValueError("X投稿に使う情報を、少なくとも1件選んでください。")
+    return "\n\n".join(
+        f"【保存記事 {number}】\nタイトル: {item['title']}\n自分のメモ: {item['note'] or 'なし'}\n本文の抜粋: {item['article'][:4500]}"
+        for number, item in enumerate(items[:5], start=1)
+    )
+
+
+def temporary_image_uploads(parts: object) -> list[Path]:
+    """Keep accepted uploads only for the current X-post generation request."""
+    uploads = parts if isinstance(parts, list) else [parts]
+    paths: list[Path] = []
+    try:
+        for upload in uploads:
+            if not getattr(upload, "filename", None) or not getattr(upload, "file", None):
+                continue
+            data = upload.file.read(10_000_001)
+            if len(data) > 10_000_000:
+                raise ValueError("画像は1枚10MBまでにしてください。")
+            suffix = Path(upload.filename).suffix.lower()
+            valid = (
+                (suffix in {".jpg", ".jpeg"} and data.startswith(b"\xff\xd8\xff"))
+                or (suffix == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
+                or (suffix == ".webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP")
+            )
+            if not valid:
+                raise ValueError("PNG・JPEG・WebP形式の画像を入れてください。")
+            with tempfile.NamedTemporaryFile(prefix="personal-flow-x-", suffix=suffix, delete=False) as output:
+                output.write(data)
+                paths.append(Path(output.name))
+        return paths
+    except Exception:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def x_post_page(result: dict[str, object]) -> bytes:
+    posts = [str(post) for post in result.get("posts", [])]
+    cards = "".join(
+        f"<article class='card'><h2>{'X投稿' if len(posts) == 1 else f'{index}つ目にコピー'}</h2>"
+        f"<div class='summary'>{html.escape(post)}</div><button class='copy' type='button' data-copy='{html.escape(post, quote=True)}'>この投稿文をコピー</button></article>"
+        for index, post in enumerate(posts, start=1)
+    )
+    body = f"""
+    <header><div><p class='eyebrow'>COPY READY</p><h1>X投稿文ができました</h1></div><p class='sub'>Xへの自動投稿はしていません。コピーして、ご自身でXへ貼り付けてください。</p></header>
+    <section class='panel'><div class='note'><strong>{'1投稿' if result.get('format') == 'single' else 'スレッド投稿'}</strong><br>{html.escape(str(result.get('reason', '')))}</div>{cards}<div class='actions'><a class='button outline' href='/x-post'>別の材料で作る</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
+    return page("X投稿文", body)
+
+
 def page(title: str, body: str) -> bytes:
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -432,14 +531,20 @@ h1{{font-size:42px;letter-spacing:-.05em;margin:0}} h2{{font-size:18px;margin:0 
 label{{display:block;font-weight:750;font-size:13px;margin-top:15px}} input,textarea{{width:100%;font:inherit;border:1px solid #cac7bd;border-radius:9px;padding:12px;background:#fff;margin-top:6px}} textarea{{min-height:100px;resize:vertical}}
 button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button.primary{{background:var(--green);width:100%;margin-top:18px}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
 .section-head{{display:flex;justify-content:space-between;align-items:center;gap:12px}} .count{{font-size:12px;color:var(--muted);background:#edebe5;border-radius:99px;padding:3px 8px}} .meta{{font-size:12px;color:var(--muted)}} .summary{{white-space:pre-wrap;font-size:14px;margin:12px 0}} .note{{background:#f2f5ef;border-radius:8px;padding:10px 12px;font-size:13px}} a{{color:var(--green)}} .empty{{color:var(--muted);padding:24px 0;text-align:center}}
-.actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}}
-@media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid{{grid-template-columns:1fr}}}}
+.actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}}
+@media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid,.entry-grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
-document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction']").forEach((form) => {{
+document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate']").forEach((form) => {{
   form.addEventListener("submit", () => {{
     const button = form.querySelector("button");
     button.disabled = true;
-    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : "Youがテーマを考えています…";
+    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : "Youがテーマを考えています…";
+  }});
+}});
+document.querySelectorAll("[data-copy]").forEach((button) => {{
+  button.addEventListener("click", async () => {{
+    await navigator.clipboard.writeText(button.dataset.copy || "");
+    button.textContent = "コピーしました";
   }});
 }});
 </script></body></html>""".encode()
@@ -457,7 +562,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urlparse(self.path)
-        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         flow = active_flow()
@@ -481,6 +586,29 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             <form method='post' action='/build-context'><label>noteプロフィールURL</label><input name='profile_url' value='{DEFAULT_NOTE_PROFILE}' required><button class='primary' type='submit'>note記事から土台を作り直す</button></form></section>
             <section class='panel'><h2>今の土台</h2><form method='post' action='/context-save'><textarea name='context' placeholder='まだ作られていません。上のボタンから作れます。'>{html.escape(context)}</textarea><div class='actions'><button type='submit'>この内容で保存する</button><a class='button outline' href='/'>戻る</a></div></form></section>"""
             self.send_html(page("自分の土台", body))
+            return
+        if route.path == "/x-post":
+            body = """
+            <header><div><p class='eyebrow'>MAKE AN X POST</p><h1>X投稿をつくる</h1></div><p class='sub'>文章や画像を入れると、Youが投稿文を整えます。Xへ自動で投稿されることはありません。</p></header>
+            <section class='panel'><form method='post' action='/x-generate' enctype='multipart/form-data'>
+            <label>投稿の材料（文章）</label><textarea name='text' placeholder='気づいたこと／伝えたいこと／投稿にしたい文章を、そのまま貼ってください。'></textarea>
+            <label>画像（任意・複数可）</label><input name='images' type='file' accept='image/png,image/jpeg,image/webp' multiple><p class='hint'>画像に書かれた文章も材料にできます。画像は投稿文作成のためだけに使い、保存しません。</p>
+            <button class='primary' type='submit'>この材料からX投稿文をつくる</button></form></section>"""
+            self.send_html(page("X投稿をつくる", body))
+            return
+        if route.path == "/x-choose-sources":
+            source_cards = "".join(
+                f"<article class='card'><label class='pick'><input type='checkbox' name='item_ids' value='{item['id']}'>この情報をX投稿に使う</label>"
+                f"<div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
+                f"<div class='summary'>{html.escape(item['summary'])}</div></article>"
+                for item in items
+            ) or "<div class='empty'>まず『情報をためる』からURLを保存してください。</div>"
+            body = f"""
+            <header><div><p class='eyebrow'>FROM SAVED INFORMATION</p><h1>ためた情報からX投稿をつくる</h1></div><p class='sub'>今回の投稿に使う記事だけを選びます。選んだ内容以外は使いません。</p></header>
+            <form method='post' action='/x-generate'><section class='panel'>{source_cards}
+            <label>投稿に足したい自分の言葉（任意）</label><textarea name='text' placeholder='たとえば、自分が引っかかった理由／今回いちばん伝えたいこと。'></textarea>
+            <div class='actions'><button type='submit'>選んだ情報からX投稿文をつくる</button><a class='button outline' href='/'>戻る</a></div></section></form>"""
+            self.send_html(page("ためた情報からX投稿", body))
             return
         if route.path == "/choose-sources":
             source_cards = "".join(
@@ -557,7 +685,8 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             ) or "<div class='empty'>まず記事を保存すると、ここに考える入口が出る。</div>"
         body = f"""
 <header><div><p class='eyebrow'>PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div><p class='sub'>流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p></header>
-<div class='grid'><section class='panel'><h2>情報を入れる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
+<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a></section>
+<div class='grid'><section class='panel' id='save'><h2>情報をためる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
 <section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/context'>自分の土台を見直す</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
@@ -586,6 +715,39 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         return database().execute("SELECT * FROM direction_runs WHERE id = ?", (direction_id,)).fetchone()
 
     def do_POST(self) -> None:
+        if self.path == "/x-generate":
+            content_type = self.headers.get("Content-Type", "")
+            images: list[Path] = []
+            try:
+                if content_type.startswith("multipart/form-data"):
+                    form = cgi.FieldStorage(
+                        fp=self.rfile,
+                        headers=self.headers,
+                        environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
+                    )
+                    text = form.getfirst("text", "").strip()
+                    file_parts = form["images"] if "images" in form else []
+                    images = temporary_image_uploads(file_parts)
+                    material = text
+                else:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    values = parse_qs(self.rfile.read(length).decode())
+                    text = values.get("text", [""])[0].strip()
+                    selected_ids = values.get("item_ids", [])
+                    selected = selected_flow_items(active_flow()["id"], selected_ids)
+                    source_material = x_material_from_items(selected)
+                    material = "\n\n".join(part for part in [source_material, f"【本人が足した言葉】\n{text}" if text else ""] if part)
+                if not material and not images:
+                    raise ValueError("文章か画像を、少なくとも1つ入れてください。")
+                result = make_x_posts(material or "画像だけが今回の材料です。", images)
+                self.send_html(x_post_page(result))
+            except (ValueError, RuntimeError, OSError) as error:
+                body = f"<h1>X投稿文を作れませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/x-post'>X投稿をつくる画面へ戻る</a></p>"
+                self.send_html(page("X投稿文を作れませんでした", body), 400)
+            finally:
+                for image in images:
+                    image.unlink(missing_ok=True)
+            return
         if self.path == "/context-save":
             length = int(self.headers.get("Content-Length", "0"))
             values = parse_qs(self.rfile.read(length).decode())
