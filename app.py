@@ -673,7 +673,8 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             f"<article class='card'><div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
             f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
             f"<div class='summary'>{html.escape(item['summary'])}</div>"
-            f"<div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div></article>"
+            f"<div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div>"
+            f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form></div></article>"
             for item in items
         ) or "<div class='empty'>まだ何もありません。最初のURLを入れてみよう。</div>"
         theme_cards = ""
