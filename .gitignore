@@ -1,6 +1,7 @@
 personal-flow.db
 personal-flow.log
 personal-flow-error.log
+personal-flow-diagnostics.log
 .venv/
 com.personalflow.local.plist
 note-flow-rules/

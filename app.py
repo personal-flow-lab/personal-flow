@@ -6,6 +6,7 @@ from __future__ import annotations
 import cgi
 import html
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -15,6 +16,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -23,6 +25,7 @@ DB_PATH = ROOT / "personal-flow.db"
 NOTE_FLOW_ROOT = ROOT / "note-flow-rules"
 THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
 X_POST_SCHEMA = ROOT / "x_post_schema.json"
+DIAGNOSTIC_LOG_PATH = ROOT / "personal-flow-diagnostics.log"
 CODEX_PATH = os.environ.get("PERSONAL_FLOW_CODEX", str(Path.home() / ".local/bin/codex"))
 DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
 
@@ -31,6 +34,44 @@ X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り�
 - 専門家ぶった断定、煽り、過剰な成果アピールをしない。
 - 材料にない経験、数字、成果、感情を足さない。
 - 読む人に命令せず、自分が考えたこと・次に試したいことへ自然に戻す。"""
+
+
+class CodexRunError(RuntimeError):
+    """A classified failure from the local Codex CLI process."""
+
+    def __init__(self, code: str, user_message: str):
+        super().__init__(user_message)
+        self.code = code
+
+
+class ThemeSuggestionError(RuntimeError):
+    """A classified failure while turning Codex output into note themes."""
+
+    def __init__(self, code: str, user_message: str):
+        super().__init__(user_message)
+        self.code = code
+
+
+def record_local_error(area: str, code: str, detail: str) -> None:
+    """Keep technical details on this Mac without exposing them in the page."""
+    try:
+        logger = logging.getLogger(f"personal-flow:{DIAGNOSTIC_LOG_PATH}")
+        if not logger.handlers:
+            handler = RotatingFileHandler(
+                DIAGNOSTIC_LOG_PATH,
+                maxBytes=1_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(handler)
+            logger.setLevel(logging.ERROR)
+            logger.propagate = False
+        compact_detail = re.sub(r"\s+", " ", detail).strip()[:4000]
+        logger.error("area=%s code=%s detail=%s", area, code, compact_detail or "none")
+    except OSError:
+        # A logging problem must never replace the original, user-facing error.
+        return
 
 
 def database() -> sqlite3.Connection:
@@ -140,7 +181,27 @@ def flow_items(flow_id: int) -> list[sqlite3.Row]:
 def selected_flow_items(flow_id: int, item_ids: list[str]) -> list[sqlite3.Row]:
     items = flow_items(flow_id)
     selected = {int(item_id) for item_id in item_ids if item_id.isdigit()}
-    return [item for item in items if item["id"] in selected] if selected else items
+    return [item for item in items if item["id"] in selected]
+
+
+def flow_item(flow_id: int, item_id: str) -> sqlite3.Row | None:
+    if not item_id.isdigit():
+        return None
+    return database().execute(
+        "SELECT * FROM items WHERE id = ? AND flow_id = ?",
+        (int(item_id), flow_id),
+    ).fetchone()
+
+
+def delete_flow_item(flow_id: int, item_id: str) -> bool:
+    if not item_id.isdigit():
+        return False
+    with database() as connection:
+        cursor = connection.execute(
+            "DELETE FROM items WHERE id = ? AND flow_id = ?",
+            (int(item_id), flow_id),
+        )
+    return cursor.rowcount == 1
 
 
 def start_next_flow(previous: sqlite3.Row, keep: bool) -> None:
@@ -280,19 +341,56 @@ def ask_codex(
         command.extend(["--output-schema", str(schema)])
     command.extend(["--output-last-message", str(output_path), prompt])
     try:
-        completed = subprocess.run(
-            command, cwd=ROOT, capture_output=True, text=True, timeout=timeout
-        )
-        if completed.returncode != 0 or not output_path.exists():
-            raise RuntimeError("Youから結果を受け取れませんでした。もう一度押してください。")
-        result = output_path.read_text(encoding="utf-8").strip()
+        try:
+            completed = subprocess.run(
+                command, cwd=ROOT, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as error:
+            record_local_error("codex", "timeout", f"timeout={timeout}s")
+            raise CodexRunError(
+                "timeout",
+                "Codexからの返答に時間がかかりすぎたため、いったん中断しました。少ししてから、もう一度試してください。",
+            ) from error
+        except OSError as error:
+            record_local_error(
+                "codex",
+                "start_failed",
+                f"executable={CODEX_PATH} error={type(error).__name__}: {error}",
+            )
+            raise CodexRunError(
+                "start_failed",
+                "Codexを使う機能を起動できませんでした。詳しい原因はこのMacの記録に残しました。Personal Flowを開き直してから、もう一度試してください。",
+            ) from error
+        if completed.returncode != 0:
+            record_local_error(
+                "codex",
+                "process_failed",
+                f"returncode={completed.returncode} stderr={(completed.stderr or '')[-3000:]}",
+            )
+            raise CodexRunError(
+                "process_failed",
+                "処理の途中でCodexが止まりました。少ししてから、もう一度試してください。",
+            )
+        try:
+            result = output_path.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            record_local_error("codex", "output_read_failed", f"{type(error).__name__}: {error}")
+            raise CodexRunError(
+                "output_read_failed",
+                "Codexから返ってきた内容を読み込めませんでした。詳しい原因はこのMacの記録に残しました。もう一度試してください。",
+            ) from error
         if not result:
-            raise RuntimeError("Youから結果を受け取れませんでした。もう一度押してください。")
+            record_local_error("codex", "empty_output", "Codex finished without a last message")
+            raise CodexRunError(
+                "empty_output",
+                "Codexから内容が返ってきませんでした。もう一度試してください。",
+            )
         return result
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("考えるのに時間がかかっています。少ししてからもう一度押してください。") from error
     finally:
-        output_path.unlink(missing_ok=True)
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as error:
+            record_local_error("codex", "temp_cleanup_failed", f"{type(error).__name__}: {error}")
 
 
 def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[dict[str, object]]:
@@ -324,17 +422,79 @@ def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[
 - 「何を書くか」では、記事の出だし・中心の問い・本人が足すとよい経験まで分かるように書く。
 - ありきたりな案より、本人が自分の経験や考えを足して書ける案を優先する。
 - 断定できない点は、原文を読み直すべき点として短く示す。
+- 返答は指定されたJSONの形だけにする。説明文、前置き、Markdownの囲みは付けない。
+- themesには必ず3〜4案を入れ、各案のtitle、approach、picked、left_outを空にしない。
+- sourcesには、この依頼に実在する保存番号だけを1つ以上入れる。
 
 【今回の記事で入れたい本人の思い】
 """ + (user_angle or "まだ指定なし。保存記事から分かる事実を優先し、本人の経験や気持ちは作らない。") + "\n\n【本人のPersonal Flowの土台】\n" + (user_context() or "まだ土台はありません。保存記事だけを根拠にする。") + "\n\n保存情報:\n" + "\n\n".join(sources)
     try:
-        proposal = json.loads(ask_codex(prompt, schema=THEME_SCHEMA))
-        themes = proposal.get("themes", [])
-        if not isinstance(themes, list) or not themes:
-            raise ValueError
-        return themes
-    except (json.JSONDecodeError, ValueError, AttributeError) as error:
-        raise RuntimeError("テーマ案の形を読み取れませんでした。もう一度押してください。") from error
+        raw_proposal = ask_codex(prompt, schema=THEME_SCHEMA)
+    except CodexRunError as error:
+        messages = {
+            "timeout": "テーマを考えるのに時間がかかりすぎたため、いったん中断しました。少ししてから、もう一度試してください。",
+            "start_failed": "テーマを考える機能を起動できませんでした。詳しい原因はこのMacの記録に残しました。Personal Flowを開き直してから、もう一度試してください。",
+            "process_failed": "テーマを考える途中でCodexが止まりました。少ししてから、もう一度試してください。",
+            "output_read_failed": "返ってきたテーマを読み込めませんでした。詳しい原因はこのMacの記録に残しました。もう一度試してください。",
+            "empty_output": "Codexからテーマ候補が返ってきませんでした。もう一度試してください。",
+        }
+        raise ThemeSuggestionError(error.code, messages.get(error.code, str(error))) from error
+    try:
+        proposal = json.loads(raw_proposal)
+    except json.JSONDecodeError as error:
+        record_local_error(
+            "theme_suggestion",
+            "invalid_json",
+            f"line={error.lineno} column={error.colno} output={raw_proposal[:2000]}",
+        )
+        raise ThemeSuggestionError(
+            "invalid_json",
+            "Codexから返ったテーマの形を読み取れませんでした。もう一度試してください。",
+        ) from error
+    if not isinstance(proposal, dict) or not isinstance(proposal.get("themes"), list):
+        record_local_error("theme_suggestion", "invalid_format", f"output={raw_proposal[:2000]}")
+        raise ThemeSuggestionError(
+            "invalid_format",
+            "Codexから返ったテーマの並び方が想定と違いました。もう一度試してください。",
+        )
+    result = proposal["themes"]
+    if not result:
+        record_local_error("theme_suggestion", "empty_themes", f"output={raw_proposal[:2000]}")
+        raise ThemeSuggestionError(
+            "empty_themes",
+            "テーマ候補が0件でした。選ぶ情報を変えるか、同じ内容でもう一度試してください。",
+        )
+    if len(result) < 3 or len(result) > 4:
+        record_local_error(
+            "theme_suggestion",
+            "invalid_theme_count",
+            f"theme_count={len(result)} output={raw_proposal[:2000]}",
+        )
+        raise ThemeSuggestionError(
+            "invalid_theme_count",
+            "返ってきたテーマの件数が想定と違いました。もう一度試してください。",
+        )
+    required_text = {"title", "approach", "picked", "left_out"}
+    valid_source_numbers = set(range(1, len(selected) + 1))
+    for index, theme in enumerate(result, start=1):
+        sources_value = theme.get("sources") if isinstance(theme, dict) else None
+        if (
+            not isinstance(theme, dict)
+            or any(not isinstance(theme.get(key), str) or not theme[key].strip() for key in required_text)
+            or not isinstance(sources_value, list)
+            or not sources_value
+            or any(not isinstance(number, int) or number not in valid_source_numbers for number in sources_value)
+        ):
+            record_local_error(
+                "theme_suggestion",
+                "invalid_theme",
+                f"theme_index={index} output={raw_proposal[:2000]}",
+            )
+            raise ThemeSuggestionError(
+                "invalid_theme",
+                "テーマ案の一部が不足していたため、安全に表示できませんでした。もう一度試してください。",
+            )
+    return result
 
 
 def note_flow_rules() -> str:
@@ -518,6 +678,41 @@ def x_post_page(result: dict[str, object]) -> bytes:
     return page("X投稿文", body)
 
 
+def theme_suggestion_error_page(
+    error: ThemeSuggestionError,
+    item_ids: list[str],
+    user_angle: str,
+) -> bytes:
+    hidden_ids = "".join(
+        f"<input type='hidden' name='item_ids' value='{html.escape(item_id, quote=True)}'>"
+        for item_id in item_ids
+    )
+    retry = (
+        "<form method='post' action='/suggest'>"
+        f"{hidden_ids}<input type='hidden' name='user_angle' value='{html.escape(user_angle, quote=True)}'>"
+        "<button type='submit'>同じ内容でもう一度試す</button></form>"
+    )
+    body = (
+        "<h1>テーマを作れませんでした</h1>"
+        f"<p class='message'>{html.escape(str(error))}</p>"
+        f"<div class='actions'>{retry}<a class='button outline' href='/choose-sources'>情報を選び直す</a>"
+        "<a class='button outline' href='/'>保存した情報へ戻る</a></div>"
+    )
+    return page("テーマを作れませんでした", body)
+
+
+def delete_item_confirmation_page(item: sqlite3.Row) -> bytes:
+    body = f"""
+    <header><div><p class='eyebrow'>CHECK BEFORE DELETE</p><h1>この情報を削除しますか？</h1></div><p class='sub'>まだ削除されていません。対象を確認してから決められます。</p></header>
+    <section class='panel'><p class='message'><strong>この操作は元に戻せません。</strong><br>この1件だけが、今回の記事の箱から削除されます。</p>
+    <article class='card'><div class='meta'>{html.escape(item['created_at'])}</div><h2>{html.escape(item['title'])}</h2>
+    <a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>
+    <div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div></article>
+    <div class='actions'><form method='post' action='/delete-item'><input type='hidden' name='item_id' value='{item['id']}'><button class='danger' type='submit'>確認したので、この1件を削除する</button></form>
+    <a class='button outline' href='/'>削除せずに戻る</a></div></section>"""
+    return page("削除する情報の確認", body)
+
+
 def page(title: str, body: str) -> bytes:
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -529,7 +724,7 @@ main{{max-width:1180px;margin:0 auto;padding:46px 24px 72px}} header{{display:fl
 h1{{font-size:42px;letter-spacing:-.05em;margin:0}} h2{{font-size:18px;margin:0 0 14px}} h3{{font-size:16px;margin:0 0 7px}} .eyebrow{{color:var(--green);font-weight:800;font-size:12px;letter-spacing:.08em;margin:0 0 6px}} .sub{{color:var(--muted);max-width:460px;margin:0;font-size:14px}}
 .grid{{display:grid;grid-template-columns:minmax(310px,.9fr) minmax(390px,1.25fr);gap:20px;align-items:start}} .panel,.card{{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 8px 22px #25251a09}} .panel{{padding:22px}} .card{{padding:18px;margin-top:12px}}
 label{{display:block;font-weight:750;font-size:13px;margin-top:15px}} input,textarea{{width:100%;font:inherit;border:1px solid #cac7bd;border-radius:9px;padding:12px;background:#fff;margin-top:6px}} textarea{{min-height:100px;resize:vertical}}
-button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button.primary{{background:var(--green);width:100%;margin-top:18px}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
+button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button.primary{{background:var(--green);width:100%;margin-top:18px}} button.danger{{background:#a3342e}} .danger-outline{{background:transparent;color:#8c2f2a;border:1px solid #cda5a1}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
 .section-head{{display:flex;justify-content:space-between;align-items:center;gap:12px}} .count{{font-size:12px;color:var(--muted);background:#edebe5;border-radius:99px;padding:3px 8px}} .meta{{font-size:12px;color:var(--muted)}} .summary{{white-space:pre-wrap;font-size:14px;margin:12px 0}} .note{{background:#f2f5ef;border-radius:8px;padding:10px 12px;font-size:13px}} a{{color:var(--green)}} .empty{{color:var(--muted);padding:24px 0;text-align:center}}
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid,.entry-grid{{grid-template-columns:1fr}}}}
@@ -674,7 +869,8 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
             f"<div class='summary'>{html.escape(item['summary'])}</div>"
             f"<div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div>"
-            f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form></div></article>"
+            f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form>"
+            f"<form method='post' action='/delete-item-confirm' class='inline-form'><input type='hidden' name='item_id' value='{item['id']}'><button class='danger-outline' type='submit'>この情報を削除</button></form></div></article>"
             for item in items
         ) or "<div class='empty'>まだ何もありません。最初のURLを入れてみよう。</div>"
         theme_cards = ""
@@ -716,6 +912,26 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         return database().execute("SELECT * FROM direction_runs WHERE id = ?", (direction_id,)).fetchone()
 
     def do_POST(self) -> None:
+        if self.path in {"/delete-item-confirm", "/delete-item"}:
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            item_id = values.get("item_id", [""])[0]
+            flow = active_flow()
+            item = flow_item(flow["id"], item_id)
+            if not item:
+                body = "<h1>削除する情報が見つかりません</h1><p class='message'>すでに削除されたか、記事の箱が切り替わった可能性があります。</p><p><a class='button' href='/'>今の情報へ戻る</a></p>"
+                self.send_html(page("情報が見つかりません", body), 404)
+                return
+            if self.path == "/delete-item-confirm":
+                self.send_html(delete_item_confirmation_page(item))
+                return
+            if not delete_flow_item(flow["id"], item_id):
+                body = "<h1>削除できませんでした</h1><p class='message'>対象が見つからなかったため、何も削除していません。</p><p><a class='button' href='/'>今の情報へ戻る</a></p>"
+                self.send_html(page("削除できませんでした", body), 409)
+                return
+            body = f"<h1>1件だけ削除しました</h1><p class='message'>「{html.escape(item['title'])}」を今回の記事の箱から削除しました。</p><p><a class='button' href='/'>今の情報へ戻る</a></p>"
+            self.send_html(page("情報を削除しました", body))
+            return
         if self.path == "/x-generate":
             content_type = self.headers.get("Content-Type", "")
             images: list[Path] = []
@@ -790,6 +1006,15 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 self.send_html(page("情報を選んでください", body), 400)
                 return
             items = selected_flow_items(flow["id"], selected_ids)
+            if not items:
+                record_local_error(
+                    "theme_suggestion",
+                    "no_valid_items",
+                    f"flow_id={flow['id']} submitted_ids={selected_ids}",
+                )
+                body = "<h1>選んだ情報が見つかりませんでした</h1><p class='message'>画面を開いたあとに記事の箱が切り替わった可能性があります。今の情報から、もう一度選び直してください。</p><p><a class='button' href='/choose-sources'>今の情報を選び直す</a></p>"
+                self.send_html(page("情報を選び直してください", body), 400)
+                return
             try:
                 proposal = suggest_note_themes(items, user_angle)
                 with database() as connection:
@@ -804,9 +1029,9 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 self.send_response(303)
                 self.send_header("Location", f"/theme-run?id={cursor.lastrowid}")
                 self.end_headers()
-            except (ValueError, RuntimeError) as error:
-                body = f"<h1>テーマを出せませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
-                self.send_html(page("テーマを出せませんでした", body), 400)
+            except ThemeSuggestionError as error:
+                status = 504 if error.code == "timeout" else 502
+                self.send_html(theme_suggestion_error_page(error, selected_ids, user_angle), status)
             return
         if self.path == "/direction":
             length = int(self.headers.get("Content-Length", "0"))
