@@ -27,6 +27,11 @@ THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
 X_POST_SCHEMA = ROOT / "x_post_schema.json"
 DIAGNOSTIC_LOG_PATH = ROOT / "personal-flow-diagnostics.log"
 CODEX_PATH = os.environ.get("PERSONAL_FLOW_CODEX", str(Path.home() / ".local/bin/codex"))
+THEME_MODEL = os.environ.get("PERSONAL_FLOW_THEME_MODEL", "gpt-5.4-mini")
+THEME_RETRY_MODEL = os.environ.get("PERSONAL_FLOW_THEME_RETRY_MODEL", "gpt-5.6-sol")
+THEME_REASONING_EFFORT = os.environ.get("PERSONAL_FLOW_THEME_REASONING", "low")
+THEME_PRIMARY_TIMEOUT = 75
+THEME_RETRY_TIMEOUT = 90
 DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
 
 X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り始めた途中にいる人の口調にする。
@@ -330,11 +335,20 @@ def ask_codex(
     timeout: int = 180,
     schema: Path | None = None,
     images: list[Path] | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    ignore_user_config: bool = False,
 ) -> str:
     """Use the existing Codex login. No API key is involved."""
     with tempfile.NamedTemporaryFile(prefix="personal-flow-", suffix=".txt", delete=False) as output:
         output_path = Path(output.name)
     command = [CODEX_PATH, "exec", "--ephemeral", "--skip-git-repo-check"]
+    if ignore_user_config:
+        command.append("--ignore-user-config")
+    if model:
+        command.extend(["--model", model])
+    if reasoning_effort:
+        command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
     for image in images or []:
         command.extend(["--image", str(image)])
     if schema:
@@ -346,7 +360,11 @@ def ask_codex(
                 command, cwd=ROOT, capture_output=True, text=True, timeout=timeout
             )
         except subprocess.TimeoutExpired as error:
-            record_local_error("codex", "timeout", f"timeout={timeout}s")
+            record_local_error(
+                "codex",
+                "timeout",
+                f"timeout={timeout}s prompt_chars={len(prompt)} model={model or 'default'} reasoning={reasoning_effort or 'default'}",
+            )
             raise CodexRunError(
                 "timeout",
                 "Codexからの返答に時間がかかりすぎたため、いったん中断しました。少ししてから、もう一度試してください。",
@@ -365,7 +383,7 @@ def ask_codex(
             record_local_error(
                 "codex",
                 "process_failed",
-                f"returncode={completed.returncode} stderr={(completed.stderr or '')[-3000:]}",
+                f"returncode={completed.returncode} model={model or 'default'} reasoning={reasoning_effort or 'default'} stderr={(completed.stderr or '')[-3000:]}",
             )
             raise CodexRunError(
                 "process_failed",
@@ -393,52 +411,58 @@ def ask_codex(
             record_local_error("codex", "temp_cleanup_failed", f"{type(error).__name__}: {error}")
 
 
-def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[dict[str, object]]:
-    """Ask the signed-in Codex CLI for a small set of grounded note ideas.
-
-    This deliberately uses the user's existing Codex login, rather than an API key.
-    """
-    selected = items[:8]
-    if not selected:
-        raise ValueError("テーマに使う情報を、少なくとも1件選んでください。")
-
+def build_theme_prompt(
+    selected: list[sqlite3.Row],
+    user_angle: str,
+    context: str,
+    compact: bool = False,
+) -> str:
+    """Build a bounded prompt so a few articles do not become a large agent task."""
     sources = []
     for number, item in enumerate(selected, start=1):
-        excerpt = item["article"][:5000]
+        summary_limit = 650 if compact else 900
+        excerpt_limit = 450 if compact else 1600
+        note_limit = 500 if compact else 900
+        summary = str(item["summary"] or "").strip()[:summary_limit]
+        excerpt = str(item["article"] or "").strip()[:excerpt_limit]
+        note = str(item["note"] or "").strip()[:note_limit]
         sources.append(
             f"【保存 {number}】\n"
-            f"タイトル: {item['title']}\n"
-            f"URL: {item['url']}\n"
-            f"自分のメモ: {item['note'] or 'なし'}\n"
-            f"本文の抜粋: {excerpt}"
+            f"タイトル: {str(item['title'])[:300]}\n"
+            f"自分のメモ: {note or 'なし'}\n"
+            f"要点: {summary or 'なし'}\n"
+            f"本文の短い抜粋: {excerpt or 'なし'}"
         )
-    prompt = """あなたは、個人が最近読んだ情報からnote記事の種を見つける編集パートナーです。
-以下の保存情報を横断して読み、note記事のテーマを3〜4案だけ提案してください。
+    retry_note = "今回は短くした材料だけで判断し、ツールや外部情報を使わないでください。\n" if compact else ""
+    angle_limit = 800 if compact else 1200
+    context_limit = 500 if compact else 900
+    angle_text = user_angle[:angle_limit] or "まだ指定なし。本人の経験や気持ちは作らない。"
+    context_text = context[:context_limit] or "まだ土台はありません。保存情報だけを根拠にする。"
+    source_text = "\n\n".join(sources)
+    return f"""あなたは、保存情報からnote記事の種を見つける編集パートナーです。
+{retry_note}以下の材料だけを読み、note記事のテーマを3案提案してください。ツール、検索、ファイル操作は不要です。
 
 守ること:
 - 単に各記事を言い換えず、複数の記事をつなぐ共通点・対比・本人のメモから切り口を作る。
 - 事実を作らない。根拠にした保存番号を各案に添える。
-- 各案はタイトル、何を書くか（4〜6文）、なぜこの情報を組み合わせたか、今回はあえて中心にしない情報、使う保存番号を返す。
-- 「何を書くか」では、記事の出だし・中心の問い・本人が足すとよい経験まで分かるように書く。
+- 各案はタイトル、何を書くか（3〜5文）、組み合わせた理由、中心にしない情報、使う保存番号を返す。
 - ありきたりな案より、本人が自分の経験や考えを足して書ける案を優先する。
-- 断定できない点は、原文を読み直すべき点として短く示す。
 - 返答は指定されたJSONの形だけにする。説明文、前置き、Markdownの囲みは付けない。
-- themesには必ず3〜4案を入れ、各案のtitle、approach、picked、left_outを空にしない。
+- themesには必ず3案を入れ、各案のtitle、approach、picked、left_outを空にしない。
 - sourcesには、この依頼に実在する保存番号だけを1つ以上入れる。
 
 【今回の記事で入れたい本人の思い】
-""" + (user_angle or "まだ指定なし。保存記事から分かる事実を優先し、本人の経験や気持ちは作らない。") + "\n\n【本人のPersonal Flowの土台】\n" + (user_context() or "まだ土台はありません。保存記事だけを根拠にする。") + "\n\n保存情報:\n" + "\n\n".join(sources)
-    try:
-        raw_proposal = ask_codex(prompt, schema=THEME_SCHEMA)
-    except CodexRunError as error:
-        messages = {
-            "timeout": "テーマを考えるのに時間がかかりすぎたため、いったん中断しました。少ししてから、もう一度試してください。",
-            "start_failed": "テーマを考える機能を起動できませんでした。詳しい原因はこのMacの記録に残しました。Personal Flowを開き直してから、もう一度試してください。",
-            "process_failed": "テーマを考える途中でCodexが止まりました。少ししてから、もう一度試してください。",
-            "output_read_failed": "返ってきたテーマを読み込めませんでした。詳しい原因はこのMacの記録に残しました。もう一度試してください。",
-            "empty_output": "Codexからテーマ候補が返ってきませんでした。もう一度試してください。",
-        }
-        raise ThemeSuggestionError(error.code, messages.get(error.code, str(error))) from error
+{angle_text}
+
+【本人のPersonal Flowの土台】
+{context_text}
+
+【保存情報】
+{source_text}"""
+
+
+def parse_theme_proposal(raw_proposal: str, source_count: int) -> list[dict[str, object]]:
+    """Validate the structured result before it reaches the page."""
     try:
         proposal = json.loads(raw_proposal)
     except json.JSONDecodeError as error:
@@ -475,7 +499,7 @@ def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[
             "返ってきたテーマの件数が想定と違いました。もう一度試してください。",
         )
     required_text = {"title", "approach", "picked", "left_out"}
-    valid_source_numbers = set(range(1, len(selected) + 1))
+    valid_source_numbers = set(range(1, source_count + 1))
     for index, theme in enumerate(result, start=1):
         sources_value = theme.get("sources") if isinstance(theme, dict) else None
         if (
@@ -495,6 +519,69 @@ def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[
                 "テーマ案の一部が不足していたため、安全に表示できませんでした。もう一度試してください。",
             )
     return result
+
+
+def theme_error_from_codex(error: CodexRunError) -> ThemeSuggestionError:
+    messages = {
+        "timeout": "短くした材料でもテーマ作成が時間内に終わりませんでした。少ししてから、もう一度試してください。",
+        "start_failed": "テーマを考える機能を起動できませんでした。詳しい原因はこのMacの記録に残しました。Personal Flowを開き直してから、もう一度試してください。",
+        "process_failed": "テーマを考える途中でCodexが止まりました。少ししてから、もう一度試してください。",
+        "output_read_failed": "返ってきたテーマを読み込めませんでした。詳しい原因はこのMacの記録に残しました。もう一度試してください。",
+        "empty_output": "Codexからテーマ候補が返ってきませんでした。もう一度試してください。",
+    }
+    return ThemeSuggestionError(error.code, messages.get(error.code, str(error)))
+
+
+def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[dict[str, object]]:
+    """Generate themes in an isolated, bounded Codex process with one compact retry."""
+    selected = items[:8]
+    if not selected:
+        raise ValueError("テーマに使う情報を、少なくとも1件選んでください。")
+
+    context = user_context()
+    attempts = [
+        ("primary", build_theme_prompt(selected, user_angle, context), THEME_PRIMARY_TIMEOUT, THEME_MODEL),
+        (
+            "compact_retry",
+            build_theme_prompt(selected, user_angle, context, compact=True),
+            THEME_RETRY_TIMEOUT,
+            THEME_RETRY_MODEL,
+        ),
+    ]
+    retryable = {
+        "timeout",
+        "process_failed",
+        "empty_output",
+        "invalid_json",
+        "invalid_format",
+        "empty_themes",
+        "invalid_theme_count",
+        "invalid_theme",
+    }
+    for attempt_index, (attempt_name, prompt, timeout, model) in enumerate(attempts):
+        try:
+            raw_proposal = ask_codex(
+                prompt,
+                timeout=timeout,
+                schema=THEME_SCHEMA,
+                model=model,
+                reasoning_effort=THEME_REASONING_EFFORT,
+                ignore_user_config=True,
+            )
+            return parse_theme_proposal(raw_proposal, len(selected))
+        except CodexRunError as error:
+            theme_error = theme_error_from_codex(error)
+        except ThemeSuggestionError as error:
+            theme_error = error
+        if attempt_index == 0 and theme_error.code in retryable:
+            record_local_error(
+                "theme_suggestion",
+                "automatic_retry",
+                f"first_error={theme_error.code} first_prompt_chars={len(prompt)} retry_prompt_chars={len(attempts[1][1])}",
+            )
+            continue
+        raise theme_error
+    raise ThemeSuggestionError("unknown", "テーマを作れませんでした。もう一度試してください。")
 
 
 def note_flow_rules() -> str:

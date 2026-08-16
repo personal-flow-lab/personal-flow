@@ -9,12 +9,25 @@ from unittest.mock import patch
 import app
 
 
-def sample_item(item_id: int = 1) -> sqlite3.Row:
+def sample_item(
+    item_id: int = 1,
+    summary: str = "記事の要点",
+    article: str = "記事本文",
+    note: str = "自分のメモ",
+) -> sqlite3.Row:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     row = connection.execute(
-        "SELECT ? AS id, ? AS title, ? AS url, ? AS note, ? AS article, ? AS created_at",
-        (item_id, "保存した記事", "https://example.com", "自分のメモ", "記事本文", "2026-08-16 10:00"),
+        "SELECT ? AS id, ? AS title, ? AS url, ? AS note, ? AS summary, ? AS article, ? AS created_at",
+        (
+            item_id,
+            "保存した記事",
+            "https://example.com",
+            note,
+            summary,
+            article,
+            "2026-08-16 10:00",
+        ),
     ).fetchone()
     connection.close()
     return row
@@ -129,6 +142,54 @@ class ThemeSuggestionTests(unittest.TestCase):
 
     def test_valid_theme_proposal_is_accepted(self) -> None:
         self.assertEqual(len(self.run_suggestion(valid_proposal())), 3)
+
+    def test_theme_generation_uses_an_isolated_lightweight_profile(self) -> None:
+        with (
+            patch.object(app, "ask_codex", return_value=valid_proposal()) as mocked,
+            patch.object(app, "user_context", return_value=""),
+        ):
+            app.suggest_note_themes([sample_item(), sample_item(2)])
+        _, kwargs = mocked.call_args
+        self.assertTrue(kwargs["ignore_user_config"])
+        self.assertEqual(kwargs["model"], app.THEME_MODEL)
+        self.assertEqual(kwargs["reasoning_effort"], "low")
+        self.assertEqual(kwargs["timeout"], app.THEME_PRIMARY_TIMEOUT)
+
+    def test_timeout_retries_once_with_a_smaller_prompt(self) -> None:
+        with (
+            patch.object(
+                app,
+                "ask_codex",
+                side_effect=[app.CodexRunError("timeout", "time"), valid_proposal()],
+            ) as mocked,
+            patch.object(app, "user_context", return_value="土台" * 1000),
+            patch.object(app, "record_local_error"),
+        ):
+            result = app.suggest_note_themes([sample_item(), sample_item(2)])
+        self.assertEqual(len(result), 3)
+        self.assertEqual(mocked.call_count, 2)
+        primary_prompt = mocked.call_args_list[0].args[0]
+        retry_prompt = mocked.call_args_list[1].args[0]
+        self.assertLess(len(retry_prompt), len(primary_prompt))
+        self.assertEqual(mocked.call_args_list[1].kwargs["timeout"], app.THEME_RETRY_TIMEOUT)
+        self.assertEqual(mocked.call_args_list[1].kwargs["model"], app.THEME_RETRY_MODEL)
+
+    def test_start_failure_is_not_retried(self) -> None:
+        with (
+            patch.object(app, "ask_codex", side_effect=app.CodexRunError("start_failed", "missing")) as mocked,
+            patch.object(app, "user_context", return_value=""),
+        ):
+            with self.assertRaises(app.ThemeSuggestionError) as caught:
+                app.suggest_note_themes([sample_item()])
+        self.assertEqual(caught.exception.code, "start_failed")
+        self.assertEqual(mocked.call_count, 1)
+
+    def test_two_article_prompt_is_bounded(self) -> None:
+        long_item = sample_item(summary="要点" * 2000, article="本文" * 5000, note="メモ" * 3000)
+        prompt = app.build_theme_prompt([long_item, long_item], "思い" * 2000, "土台" * 2000)
+        compact = app.build_theme_prompt([long_item, long_item], "思い" * 2000, "土台" * 2000, compact=True)
+        self.assertLess(len(prompt), 10_000)
+        self.assertLess(len(compact), len(prompt))
 
     def test_invalid_json_has_its_own_error(self) -> None:
         with self.assertRaises(app.ThemeSuggestionError) as caught:
