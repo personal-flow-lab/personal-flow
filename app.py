@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import tempfile
@@ -41,6 +42,9 @@ DRAFT_RETRY_TIMEOUT = 150
 THUMBNAIL_MODEL = os.environ.get("PERSONAL_FLOW_THUMBNAIL_MODEL", "gpt-5.4-mini")
 THUMBNAIL_TIMEOUT = 90
 THUMBNAIL_ASSET_DIR = ROOT / "thumbnail-references"
+THUMBNAIL_OUTPUT_DIR = ROOT / "generated-thumbnails"
+THUMBNAIL_IMAGE_MODEL = os.environ.get("PERSONAL_FLOW_THUMBNAIL_IMAGE_MODEL", "gpt-5.6-sol")
+THUMBNAIL_IMAGE_TIMEOUT = 600
 DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
 
 X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り始めた途中にいる人の口調にする。
@@ -76,6 +80,14 @@ class DirectionSuggestionError(RuntimeError):
 
 class DraftGenerationError(RuntimeError):
     """A classified failure while creating a note draft."""
+
+    def __init__(self, code: str, user_message: str):
+        super().__init__(user_message)
+        self.code = code
+
+
+class ThumbnailGenerationError(RuntimeError):
+    """A classified failure while producing the final thumbnail image."""
 
     def __init__(self, code: str, user_message: str):
         super().__init__(user_message)
@@ -1227,6 +1239,175 @@ def make_thumbnail_instruction(
     ).strip()
 
 
+def thumbnail_reference_paths(
+    references: dict[str, dict[str, str]],
+    extra_image: Path | None = None,
+) -> list[Path]:
+    """Keep the permanent two-image order stable for every generation."""
+    if not all(slot in references for slot in ("style", "layout")):
+        raise ThumbnailGenerationError(
+            "missing_references",
+            "先にサムネ設定で、いつもの参考画像2枚を登録してください。",
+        )
+    paths = [THUMBNAIL_ASSET_DIR / references[slot]["stored_name"] for slot in ("style", "layout")]
+    if any(not path.is_file() for path in paths):
+        raise ThumbnailGenerationError(
+            "missing_references",
+            "登録した参考画像を読み込めませんでした。サムネ設定で2枚を確認してください。",
+        )
+    if extra_image:
+        paths.append(extra_image)
+    return paths
+
+
+def build_thumbnail_generation_command(
+    instruction: str,
+    reference_paths: list[Path],
+    target_path: Path,
+    message_path: Path,
+) -> list[str]:
+    reference_roles = [
+        "画像1は、絵柄・色・キャラクターの雰囲気の基準です。内容や文字をコピーしないでください。",
+        "画像2は、文字配置・余白・レイアウトの基準です。記事と無関係な文字をコピーしないでください。",
+    ]
+    if len(reference_paths) == 3:
+        reference_roles.append("画像3は今回の記事だけの追加参考です。使える要素だけを取り入れてください。")
+    prompt = f"""$imagegen
+Use case: ads-marketing
+Asset type: note記事のタイトル用サムネイル画像
+
+次の指示に従い、note記事のタイトル用サムネイル画像を1枚、実際に生成してください。
+
+【画像の役割】
+{chr(10).join(f'- {role}' for role in reference_roles)}
+
+【画像指示文】
+{instruction[:16000]}
+
+守ること:
+- 添付画像は上記の役割で参照し、毎回同じ2枚を再現の基準にする。
+- サムネ内の日本語は画像指示文に指定された文字だけを正確に使う。不要な文字、ロゴ、透かしを足さない。
+- 完成記事にない成果、数字、肩書き、人物を足さない。
+- 生成した最終画像を、必ず次の場所へPNGで保存する: {target_path}
+- 画像を保存したあと、返答は保存先の絶対パス1行だけにする。
+"""
+    command = [
+        CODEX_PATH,
+        "exec",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--sandbox",
+        "workspace-write",
+        "--cd",
+        str(ROOT),
+        "--model",
+        THUMBNAIL_IMAGE_MODEL,
+        "--config",
+        'model_reasoning_effort="low"',
+        "--add-dir",
+        str(THUMBNAIL_OUTPUT_DIR),
+    ]
+    for reference_path in reference_paths:
+        command.extend(["--image", str(reference_path)])
+    command.extend(["--output-last-message", str(message_path), prompt])
+    return command
+
+
+def valid_thumbnail_file(path: Path) -> bool:
+    try:
+        if not path.is_file() or not 100 <= path.stat().st_size <= 40_000_000:
+            return False
+        with path.open("rb") as input_file:
+            header = input_file.read(12)
+        return header.startswith(b"\x89PNG\r\n\x1a\n")
+    except OSError:
+        return False
+
+
+def generate_thumbnail_image(
+    instruction: str,
+    references: dict[str, dict[str, str]],
+    extra_image: Path | None = None,
+) -> Path:
+    """Use the signed-in Codex image tool; no API key or API billing is configured."""
+    reference_paths = thumbnail_reference_paths(references, extra_image)
+    try:
+        THUMBNAIL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        record_local_error("thumbnail_image", "save_folder_failed", f"{type(error).__name__}: {error}")
+        raise ThumbnailGenerationError(
+            "save_folder_failed",
+            "完成画像を保存する場所を用意できませんでした。Personal Flowを開き直して、もう一度試してください。",
+        ) from error
+    filename = f"note-thumbnail-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}.png"
+    target_path = THUMBNAIL_OUTPUT_DIR / filename
+    with tempfile.NamedTemporaryFile(prefix="personal-flow-thumbnail-message-", suffix=".txt", delete=False) as output:
+        message_path = Path(output.name)
+    command = build_thumbnail_generation_command(instruction, reference_paths, target_path, message_path)
+    try:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=THUMBNAIL_IMAGE_TIMEOUT,
+                cwd=ROOT,
+            )
+        except subprocess.TimeoutExpired as error:
+            record_local_error("thumbnail_image", "timeout", f"timeout={THUMBNAIL_IMAGE_TIMEOUT}s refs={len(reference_paths)}")
+            raise ThumbnailGenerationError(
+                "timeout",
+                "サムネ画像の作成に時間がかかりすぎたため中断しました。同じ完成記事でもう一度試してください。",
+            ) from error
+        except OSError as error:
+            record_local_error("thumbnail_image", "start_failed", f"{type(error).__name__}: {error}")
+            raise ThumbnailGenerationError(
+                "start_failed",
+                "画像を作る機能を起動できませんでした。Personal Flowを開き直して、もう一度試してください。",
+            ) from error
+        if completed.returncode != 0:
+            record_local_error(
+                "thumbnail_image",
+                "process_failed",
+                f"returncode={completed.returncode} refs={len(reference_paths)} stderr={(completed.stderr or '')[-3000:]}",
+            )
+            raise ThumbnailGenerationError(
+                "process_failed",
+                "サムネ画像を作る途中でCodexが止まりました。少ししてから、もう一度試してください。",
+            )
+        if not valid_thumbnail_file(target_path):
+            detail = ""
+            try:
+                detail = message_path.read_text(encoding="utf-8")[:2000]
+            except OSError:
+                pass
+            record_local_error("thumbnail_image", "missing_output", f"target={target_path.name} message={detail}")
+            raise ThumbnailGenerationError(
+                "missing_output",
+                "画像生成は終わりましたが、完成画像を画面へ読み込めませんでした。同じ内容でもう一度試してください。",
+            )
+        try:
+            save_setting(
+                "thumbnail_latest_result",
+                json.dumps({"filename": filename, "instruction": instruction}, ensure_ascii=False),
+            )
+        except sqlite3.Error as error:
+            # The completed image is still useful even if its optional history entry cannot be saved.
+            record_local_error("thumbnail_image", "history_save_failed", f"{type(error).__name__}: {error}")
+        return target_path
+    finally:
+        message_path.unlink(missing_ok=True)
+
+
+def generated_thumbnail_path(filename: str) -> Path | None:
+    """Resolve only files created by Personal Flow; never accept an arbitrary path."""
+    if not re.fullmatch(r"note-thumbnail-\d{8}-\d{6}-[0-9a-f]{8}\.png", filename):
+        return None
+    path = THUMBNAIL_OUTPUT_DIR / filename
+    return path if valid_thumbnail_file(path) else None
+
+
 def thumbnail_settings_page(message: str = "") -> bytes:
     references = thumbnail_references()
     base_prompt = setting_value("thumbnail_base_prompt")
@@ -1263,21 +1444,24 @@ def thumbnail_prepare_page(message: str = "") -> bytes:
     {f"<p class='message'>{html.escape(message)}</p>" if message else ""}
     <section class='panel'><div class='note'><strong>{html.escape(status)}</strong><br>画像1は絵柄・色・キャラクター、画像2は文字配置・余白・レイアウトの基準です。</div>
     <div class='actions'><a class='button outline' href='/thumbnail-settings'>いつものサムネ設定を確認・変更する</a></div>
-    <form method='post' action='/thumbnail-instruction' enctype='multipart/form-data'>
+    <form method='post' action='/thumbnail-generate' enctype='multipart/form-data'>
     <label>Claudeで添削した完成記事</label><textarea name='final_article' style='min-height:320px' placeholder='Claudeで完成したnote記事を、ここへ貼ってください。'>{html.escape(article)}</textarea>
     <label>3枚目の参考画像（今回だけ・任意）</label><input name='extra_image' type='file' accept='image/png,image/jpeg,image/webp'>
-    <p class='hint'>通常は登録済みの2枚だけで大丈夫です。3枚目は、この回の指示文作成だけに使い、保存しません。</p>
-    <button class='primary' type='submit' {'disabled' if not ready else ''}>完成記事からサムネ用の画像指示文を作る</button>
-    </form><p class='hint'>ここでは画像そのものは生成しません。まず内容に合う画像指示文を作ります。</p></section>"""
+    <p class='hint'>通常は登録済みの2枚だけで大丈夫です。3枚目は、この回の画像作成だけに使い、保存しません。</p>
+    <button class='primary' type='submit' {'disabled' if not ready else ''}>サムネ画像を作る</button>
+    </form><p class='hint'>画像づくりには数分かかることがあります。1回押すと通常より多めにCodex利用枠を使いますが、APIキーや追加料金の設定は使いません。</p></section>"""
     return page("サムネ準備", body)
 
 
-def thumbnail_instruction_page(instruction: str) -> bytes:
+def thumbnail_result_page(image_filename: str, used_extra: bool) -> bytes:
+    image_url = f"/thumbnail-image?name={image_filename}"
+    download_url = f"{image_url}&amp;download=1"
     body = f"""
-    <header><div><p class='eyebrow'>THUMBNAIL INSTRUCTION</p><h1>サムネ用の画像指示文</h1></div><p class='sub'>登録済みの2枚と基本プロンプト、完成記事を使って作りました。画像そのものはまだ生成していません。</p></header>
-    <section class='panel'><div class='summary'>{html.escape(instruction)}</div>
-    <div class='actions'><button class='copy' type='button' data-copy='{html.escape(instruction, quote=True)}'>画像指示文をコピー</button><a class='button outline' href='/thumbnail'>完成記事を見直す</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
-    return page("サムネ用の画像指示文", body)
+    <header><div><p class='eyebrow'>THUMBNAIL READY</p><h1>noteのサムネ画像ができました</h1></div><p class='sub'>登録済みの参考画像2枚を毎回自動で使いました。{'今回は3枚目も加えました。' if used_extra else ''}</p></header>
+    <section class='panel'><img class='generated-image' src='{image_url}' alt='生成したnote記事のサムネ画像'>
+    <p class='hint'>画像はこのMacのPersonal Flowにも保存済みです。内容と文字を確認してからnoteへ使ってください。</p>
+    <div class='actions'><a class='button' href='{download_url}'>画像をダウンロード</a><a class='button outline' href='/thumbnail'>同じ記事で作り直す</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
+    return page("noteのサムネ画像", body)
 
 
 def x_post_page(result: dict[str, object]) -> bytes:
@@ -1444,14 +1628,14 @@ h1{{font-size:42px;letter-spacing:-.05em;margin:0}} h2{{font-size:18px;margin:0 
 label{{display:block;font-weight:750;font-size:13px;margin-top:15px}} input,textarea{{width:100%;font:inherit;border:1px solid #cac7bd;border-radius:9px;padding:12px;background:#fff;margin-top:6px}} textarea{{min-height:100px;resize:vertical}}
 button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button:disabled{{opacity:.45;cursor:not-allowed}} button.primary{{background:var(--green);width:100%;margin-top:18px}} button.danger{{background:#a3342e}} .danger-outline{{background:transparent;color:#8c2f2a;border:1px solid #cda5a1}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
 .section-head{{display:flex;justify-content:space-between;align-items:center;gap:12px}} .count{{font-size:12px;color:var(--muted);background:#edebe5;border-radius:99px;padding:3px 8px}} .meta{{font-size:12px;color:var(--muted)}} .summary{{white-space:pre-wrap;font-size:14px;margin:12px 0}} .note{{background:#f2f5ef;border-radius:8px;padding:10px 12px;font-size:13px}} a{{color:var(--green)}} .empty{{color:var(--muted);padding:24px 0;text-align:center}}
-.actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}}
+.actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}} .generated-image{{display:block;width:100%;height:auto;border-radius:12px;border:1px solid var(--line);background:#fff}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid,.entry-grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
-document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate'], form[action='/thumbnail-instruction']").forEach((form) => {{
+document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate'], form[action='/thumbnail-generate']").forEach((form) => {{
   form.addEventListener("submit", () => {{
     const button = form.querySelector("button");
     button.disabled = true;
-    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : form.action.endsWith("/thumbnail-instruction") ? "Youがサムネ用の画像指示文を作っています…" : "Youがテーマを考えています…";
+    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : form.action.endsWith("/thumbnail-generate") ? "Youがサムネ画像を作っています…（数分かかることがあります）" : "Youがテーマを考えています…";
   }});
 }});
 document.querySelectorAll("[data-copy]").forEach((button) => {{
@@ -1492,14 +1676,36 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def send_thumbnail_file(self, path: Path, download: bool = False) -> None:
+        try:
+            content = path.read_bytes()
+        except OSError:
+            self.send_html(page("見つかりません", "<h1>サムネ画像が見つかりません</h1>"), 404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Content-Disposition", f"{'attachment' if download else 'inline'}; filename=\"{path.name}\"")
+        self.end_headers()
+        self.wfile.write(content)
+
     def do_GET(self) -> None:
         route = urlparse(self.path)
+        query = parse_qs(route.query)
+        if route.path == "/thumbnail-image":
+            filename = query.get("name", [""])[0]
+            image_path = generated_thumbnail_path(filename)
+            if not image_path:
+                self.send_html(page("見つかりません", "<h1>サムネ画像が見つかりません</h1>"), 404)
+                return
+            self.send_thumbnail_file(image_path, query.get("download", [""])[0] == "1")
+            return
         if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize", "/thumbnail", "/thumbnail-settings"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         flow = active_flow()
         items = flow_items(flow["id"])
-        query = parse_qs(route.query)
         if route.path == "/thumbnail-settings":
             self.send_html(thumbnail_settings_page())
             return
@@ -1636,7 +1842,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             ) or "<div class='empty'>まず記事を保存すると、ここに考える入口が出る。</div>"
         body = f"""
 <header><div><p class='eyebrow'>PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div><p class='sub'>流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p></header>
-<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ準備</strong><span>完成記事を貼り、いつもの設定と画像2枚を自動で使う。</span></a></section>
+<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ画像をつくる</strong><span>完成記事を貼るだけで、いつもの参考画像2枚を使って画像まで作る。</span></a></section>
 <div class='grid'><section class='panel' id='save'><h2>情報をためる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
@@ -1692,7 +1898,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 record_local_error("thumbnail_settings", "save_failed", f"{type(error).__name__}: {error}")
                 self.send_html(thumbnail_settings_page(str(error)), 400)
             return
-        if self.path == "/thumbnail-instruction":
+        if self.path == "/thumbnail-generate":
             content_type = self.headers.get("Content-Type", "")
             extra_path: Path | None = None
             if not content_type.startswith("multipart/form-data"):
@@ -1712,18 +1918,29 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                     with tempfile.NamedTemporaryFile(prefix="personal-flow-thumbnail-extra-", suffix=suffix, delete=False) as output:
                         output.write(data)
                         extra_path = Path(output.name)
+                references = thumbnail_references()
                 instruction = make_thumbnail_instruction(
                     final_article,
                     setting_value("thumbnail_base_prompt"),
-                    thumbnail_references(),
+                    references,
                     extra_path,
                 )
-                self.send_html(thumbnail_instruction_page(instruction))
+                generated = generate_thumbnail_image(
+                    instruction,
+                    references,
+                    extra_path,
+                )
+                self.send_html(thumbnail_result_page(generated.name, extra_path is not None))
             except ValueError as error:
                 self.send_html(thumbnail_prepare_page(str(error)), 400)
             except CodexRunError as error:
                 record_local_error("thumbnail_instruction", error.code, str(error))
-                self.send_html(thumbnail_prepare_page("画像指示文を作る途中で止まりました。同じ完成記事でもう一度試してください。"), 504 if error.code == "timeout" else 502)
+                self.send_html(thumbnail_prepare_page("サムネ画像を作る準備の途中で止まりました。同じ完成記事でもう一度試してください。"), 504 if error.code == "timeout" else 502)
+            except ThumbnailGenerationError as error:
+                self.send_html(
+                    thumbnail_prepare_page(str(error)),
+                    504 if error.code == "timeout" else 502,
+                )
             finally:
                 if extra_path:
                     extra_path.unlink(missing_ok=True)

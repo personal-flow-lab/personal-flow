@@ -107,6 +107,10 @@ class HandlerHarness(app.PersonalFlowHandler):
     def body(self) -> str:
         return self.wfile.getvalue().decode()
 
+    @property
+    def raw_body(self) -> bytes:
+        return self.wfile.getvalue()
+
 
 class SelectedItemsTests(unittest.TestCase):
     def test_invalid_or_missing_ids_never_fall_back_to_all_items(self) -> None:
@@ -595,11 +599,14 @@ class ThumbnailPreparationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.db_patch = patch.object(app, "DB_PATH", Path(self.temp.name) / "thumbnail.db")
         self.asset_patch = patch.object(app, "THUMBNAIL_ASSET_DIR", Path(self.temp.name) / "references")
+        self.output_patch = patch.object(app, "THUMBNAIL_OUTPUT_DIR", Path(self.temp.name) / "generated")
         self.db_patch.start()
         self.asset_patch.start()
+        self.output_patch.start()
         app.database().close()
 
     def tearDown(self) -> None:
+        self.output_patch.stop()
         self.asset_patch.stop()
         self.db_patch.stop()
         self.temp.cleanup()
@@ -628,6 +635,8 @@ class ThumbnailPreparationTests(unittest.TestCase):
         self.assertIn("登録済みの基本プロンプトと参考画像2枚を、毎回自動で使います", page)
         self.assertNotIn("type='file' accept='image/png,image/jpeg,image/webp' multiple", page)
         self.assertIn("3枚目の参考画像（今回だけ・任意）", page)
+        self.assertIn("サムネ画像を作る", page)
+        self.assertIn("APIキーや追加料金の設定は使いません", page)
 
     def test_instruction_uses_both_registered_images_without_generating_an_image(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"image-data"
@@ -643,6 +652,88 @@ class ThumbnailPreparationTests(unittest.TestCase):
         self.assertEqual(len(kwargs["images"]), 2)
         self.assertTrue(kwargs["ignore_user_config"])
         self.assertIn("画像そのものは生成せず", mocked.call_args.args[0])
+
+    def test_generation_always_passes_two_registered_images_and_optional_third(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + (b"image-data" * 20)
+        references = app.save_thumbnail_settings(
+            "基本プロンプト",
+            {"style": FakeUpload("style.png", png), "layout": FakeUpload("layout.png", png)},
+            set(),
+        )
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            marker = "保存する: "
+            target = Path(command[-1].split(marker, 1)[1].splitlines()[0])
+            target.write_bytes(png)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(app.subprocess, "run", side_effect=fake_run) as mocked:
+            generated = app.generate_thumbnail_image("完成した画像指示文", references)
+        command = mocked.call_args.args[0]
+        passed_images = [command[index + 1] for index, value in enumerate(command) if value == "--image"]
+        self.assertEqual(
+            passed_images,
+            [
+                str(app.THUMBNAIL_ASSET_DIR / references["style"]["stored_name"]),
+                str(app.THUMBNAIL_ASSET_DIR / references["layout"]["stored_name"]),
+            ],
+        )
+        self.assertIn("$imagegen", command[-1])
+        self.assertNotIn("OPENAI_API_KEY", " ".join(command))
+        self.assertNotIn("--ask-for-approval", command)
+        self.assertTrue(generated.is_file())
+
+        extra = Path(self.temp.name) / "extra.png"
+        extra.write_bytes(png)
+        with patch.object(app.subprocess, "run", side_effect=fake_run) as mocked_extra:
+            app.generate_thumbnail_image("完成した画像指示文", references, extra)
+        extra_command = mocked_extra.call_args.args[0]
+        extra_images = [extra_command[index + 1] for index, value in enumerate(extra_command) if value == "--image"]
+        self.assertEqual(extra_images[:2], passed_images)
+        self.assertEqual(extra_images[2], str(extra))
+
+    def test_missing_generated_image_is_a_clear_failure(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + (b"image-data" * 20)
+        references = app.save_thumbnail_settings(
+            "基本プロンプト",
+            {"style": FakeUpload("style.png", png), "layout": FakeUpload("layout.png", png)},
+            set(),
+        )
+        completed = subprocess.CompletedProcess(["codex"], 0, "", "")
+        with (
+            patch.object(app.subprocess, "run", return_value=completed),
+            patch.object(app, "record_local_error"),
+            self.assertRaisesRegex(app.ThumbnailGenerationError, "完成画像"),
+        ):
+            app.generate_thumbnail_image("画像指示文", references)
+
+    def test_result_page_displays_and_downloads_the_saved_image(self) -> None:
+        filename = "note-thumbnail-20260816-120000-abcdef12.png"
+        page = app.thumbnail_result_page(filename, False).decode()
+        self.assertIn("noteのサムネ画像ができました", page)
+        self.assertIn(f"/thumbnail-image?name={filename}", page)
+        self.assertIn(f"/thumbnail-image?name={filename}&amp;download=1", page)
+        self.assertIn("画像をダウンロード", page)
+        self.assertIn("このMacのPersonal Flowにも保存済み", page)
+        self.assertNotIn("画像指示文", page)
+
+    def test_generated_image_path_rejects_unrelated_paths(self) -> None:
+        self.assertIsNone(app.generated_thumbnail_path("../../personal-flow.db"))
+        self.assertIsNone(app.generated_thumbnail_path("other.png"))
+
+    def test_saved_image_route_supports_display_and_download(self) -> None:
+        app.THUMBNAIL_OUTPUT_DIR.mkdir(parents=True)
+        filename = "note-thumbnail-20260816-120000-abcdef12.png"
+        image = b"\x89PNG\r\n\x1a\n" + (b"image-data" * 20)
+        (app.THUMBNAIL_OUTPUT_DIR / filename).write_bytes(image)
+        display = HandlerHarness("GET", f"/thumbnail-image?name={filename}")
+        self.assertEqual(display.status, 200)
+        self.assertEqual(display.response_headers["Content-Type"], "image/png")
+        self.assertTrue(display.response_headers["Content-Disposition"].startswith("inline"))
+        self.assertEqual(display.raw_body, image)
+        download = HandlerHarness("GET", f"/thumbnail-image?name={filename}&download=1")
+        self.assertEqual(download.status, 200)
+        self.assertTrue(download.response_headers["Content-Disposition"].startswith("attachment"))
 
     def test_settings_page_is_the_only_place_for_replace_and_remove(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"image-data"
