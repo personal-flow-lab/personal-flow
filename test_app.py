@@ -64,8 +64,18 @@ def valid_draft() -> str:
 {body}
 5. 公開前チェック
 作っていない事実がないか確認する。
-6. ハッシュタグ案
-#学び"""
+6. おすすめハッシュタグ
+- #学び｜記事の種類が学びの記録だから
+- #AI活用｜中心テーマがAIの使い方だから
+- #初心者の疑問｜知らない分野を覚える悩みを扱うから
+- #図解｜理解に使った具体的な方法だから
+- #Cloudflare｜記事で学んだ関連語だから"""
+
+
+class FakeUpload:
+    def __init__(self, filename: str, data: bytes):
+        self.filename = filename
+        self.file = io.BytesIO(data)
 
 
 class HandlerHarness(app.PersonalFlowHandler):
@@ -540,6 +550,114 @@ class DraftGenerationTests(unittest.TestCase):
         self.assertIn("本人が話していない出来事", prompt)
         self.assertIn("足りない本人の体験は作らない", prompt)
 
+    def test_hashtags_are_grounded_limited_and_parseable(self) -> None:
+        prompt = app.build_draft_prompt(
+            self.draft_theme(), [sample_item()], "方向性", "本人メモ", "約2,000字", "本人の土台"
+        )
+        for rule in ("記事の種類", "中心テーマ", "具体的な悩みや問い", "関連語", "一般的な人気タグで水増ししない"):
+            self.assertIn(rule, prompt)
+        suggestions = app.parse_hashtag_suggestions(valid_draft())
+        self.assertEqual(len(suggestions), 5)
+        self.assertEqual(suggestions[0], ("#学び", "記事の種類が学びの記録だから"))
+
+    def test_duplicate_or_excessive_hashtags_trigger_one_retry(self) -> None:
+        broken = valid_draft().replace("#AI活用", "#学び")
+        with (
+            patch.object(app, "ask_codex", side_effect=[broken, valid_draft()]) as mocked,
+            patch.object(app, "user_context", return_value=""),
+            patch.object(app, "record_local_error"),
+        ):
+            result = app.make_note_draft(self.draft_theme(), [sample_item()], "", "", "約2,000字")
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(len(app.parse_hashtag_suggestions(result)), 5)
+
+    def test_three_hashtags_are_allowed_when_theme_is_unclear(self) -> None:
+        shorter = "\n".join(valid_draft().splitlines()[:-2])
+        self.assertEqual(len(app.parse_hashtag_suggestions(app.validate_note_draft(shorter, "約2,000字"))), 3)
+
+    def test_draft_page_shows_reasons_and_copies_tags_only(self) -> None:
+        markdown_result = valid_draft().replace("6. おすすめハッシュタグ", "## 6. おすすめハッシュタグ")
+        draft_only, parsed = app.split_draft_hashtags(markdown_result)
+        self.assertNotIn("おすすめハッシュタグ", draft_only)
+        self.assertEqual(len(parsed), 5)
+        result = app.draft_result_page(markdown_result).decode()
+        self.assertIn("おすすめハッシュタグ", result)
+        self.assertIn("記事の種類が学びの記録だから", result)
+        self.assertIn("タグだけをまとめてコピー", result)
+        self.assertIn("data-copy='#学び #AI活用 #初心者の疑問 #図解 #Cloudflare'", result)
+        self.assertNotIn("data-copy='#学び｜", result)
+        self.assertIn("タイトル、見出し画像、本文、外部共有", result)
+        self.assertIn("完成記事を貼ってサムネ準備へ", result)
+
+
+class ThumbnailPreparationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(app, "DB_PATH", Path(self.temp.name) / "thumbnail.db")
+        self.asset_patch = patch.object(app, "THUMBNAIL_ASSET_DIR", Path(self.temp.name) / "references")
+        self.db_patch.start()
+        self.asset_patch.start()
+        app.database().close()
+
+    def tearDown(self) -> None:
+        self.asset_patch.stop()
+        self.db_patch.stop()
+        self.temp.cleanup()
+
+    def test_unregistered_page_explains_one_time_setup_and_disables_generation(self) -> None:
+        result = app.thumbnail_prepare_page().decode()
+        self.assertIn("Claudeで添削した完成記事", result)
+        self.assertIn("最初の1回だけ", result)
+        self.assertIn("disabled", result)
+        with self.assertRaisesRegex(ValueError, "基本プロンプト"):
+            app.make_thumbnail_instruction("完成記事", "", {}, None)
+
+    def test_two_reference_images_and_prompt_are_persistent_and_automatic(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"image-data"
+        saved = app.save_thumbnail_settings(
+            "Obsidianから貼った基本プロンプト",
+            {
+                "style": FakeUpload("いつもの絵柄.png", png),
+                "layout": FakeUpload("いつもの配置.png", png),
+            },
+            set(),
+        )
+        self.assertEqual(set(saved), {"style", "layout"})
+        self.assertEqual(app.setting_value("thumbnail_base_prompt"), "Obsidianから貼った基本プロンプト")
+        page = app.thumbnail_prepare_page().decode()
+        self.assertIn("登録済みの基本プロンプトと参考画像2枚を、毎回自動で使います", page)
+        self.assertNotIn("type='file' accept='image/png,image/jpeg,image/webp' multiple", page)
+        self.assertIn("3枚目の参考画像（今回だけ・任意）", page)
+
+    def test_instruction_uses_both_registered_images_without_generating_an_image(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"image-data"
+        references = app.save_thumbnail_settings(
+            "基本プロンプト",
+            {"style": FakeUpload("style.png", png), "layout": FakeUpload("layout.png", png)},
+            set(),
+        )
+        with patch.object(app, "ask_codex", return_value="完成した画像指示文") as mocked:
+            result = app.make_thumbnail_instruction("Claude完成記事", "基本プロンプト", references)
+        self.assertEqual(result, "完成した画像指示文")
+        _, kwargs = mocked.call_args
+        self.assertEqual(len(kwargs["images"]), 2)
+        self.assertTrue(kwargs["ignore_user_config"])
+        self.assertIn("画像そのものは生成せず", mocked.call_args.args[0])
+
+    def test_settings_page_is_the_only_place_for_replace_and_remove(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"image-data"
+        app.save_thumbnail_settings(
+            "基本プロンプト",
+            {"style": FakeUpload("style.png", png), "layout": FakeUpload("layout.png", png)},
+            set(),
+        )
+        settings = app.thumbnail_settings_page().decode()
+        prepare = app.thumbnail_prepare_page().decode()
+        self.assertIn("画像1を登録・差し替え", settings)
+        self.assertIn("画像2を登録・差し替え", settings)
+        self.assertIn("name='remove_style'", settings)
+        self.assertNotIn("name='remove_style'", prepare)
+
 
 class ArticleFlowHttpTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -626,6 +744,9 @@ class ArticleFlowHttpTests(unittest.TestCase):
             self.assertEqual(status, 200)
             for label in ("タイトル案", "記事の軸", "見出し", "本文初稿", "公開前チェック"):
                 self.assertIn(label, draft_page)
+            self.assertIn("おすすめハッシュタグ", draft_page)
+            self.assertIn("タグだけをまとめてコピー", draft_page)
+            self.assertIn("完成記事を貼ってサムネ準備へ", draft_page)
         self.assertEqual(mocked.call_count, 3)
         for call in mocked.call_args_list:
             self.assertTrue(call.kwargs["ignore_user_config"])

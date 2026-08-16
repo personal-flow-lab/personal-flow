@@ -38,6 +38,9 @@ DRAFT_RETRY_MODEL = os.environ.get("PERSONAL_FLOW_DRAFT_RETRY_MODEL", "gpt-5.4-m
 DRAFT_REASONING_EFFORT = os.environ.get("PERSONAL_FLOW_DRAFT_REASONING", "low")
 DRAFT_PRIMARY_TIMEOUT = 180
 DRAFT_RETRY_TIMEOUT = 150
+THUMBNAIL_MODEL = os.environ.get("PERSONAL_FLOW_THUMBNAIL_MODEL", "gpt-5.4-mini")
+THUMBNAIL_TIMEOUT = 90
+THUMBNAIL_ASSET_DIR = ROOT / "thumbnail-references"
 DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
 
 X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り始めた途中にいる人の口調にする。
@@ -188,17 +191,25 @@ def active_flow() -> sqlite3.Row:
 
 
 def user_context() -> str:
-    row = database().execute("SELECT value FROM app_settings WHERE key = 'user_context'").fetchone()
+    return setting_value("user_context")
+
+
+def setting_value(key: str) -> str:
+    row = database().execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
     return row["value"].strip() if row else ""
 
 
-def save_user_context(value: str) -> None:
+def save_setting(key: str, value: str) -> None:
     with database() as connection:
         connection.execute(
-            "INSERT INTO app_settings(key, value, updated_at) VALUES ('user_context', ?, ?) "
+            "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (value.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")),
+            (key, value.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")),
         )
+
+
+def save_user_context(value: str) -> None:
+    save_setting("user_context", value)
 
 
 def flow_items(flow_id: int) -> list[sqlite3.Row]:
@@ -484,6 +495,7 @@ def ask_note_codex(
     model: str,
     reasoning_effort: str,
     schema: Path | None = None,
+    images: list[Path] | None = None,
 ) -> str:
     """Run every article-planning step with the isolated note profile."""
     return ask_codex(
@@ -493,6 +505,7 @@ def ask_note_codex(
         model=model,
         reasoning_effort=reasoning_effort,
         ignore_user_config=True,
+        images=images,
     )
 
 
@@ -796,7 +809,14 @@ def build_draft_prompt(
 3. H2見出し案
 4. 本文初稿
 5. 公開前チェック
-6. ハッシュタグ案
+6. おすすめハッシュタグ
+
+ハッシュタグの決まり:
+- 原則5個。テーマがはっきりしない時は3〜4個に減らし、一般的な人気タグで水増ししない。
+- 「記事の種類」「中心テーマ」「具体的な悩みや問い」「関連語」をバランスよく選び、材料にある時だけ「連載名・商品名」を加える。
+- 本文、固めた方向性、選んだテーマ、本人メモのどれかに根拠があるタグだけにする。
+- 各行を必ず「- #タグ｜このタグを選んだ短い理由」の形にする。タグには#を付け、同じタグを重ねない。
+- 検索上位を保証する説明や、内容と無関係な人気タグは出さない。
 
 本人の材料が足りない部分は作らず、本文内で断定しないか、公開前チェックに確認事項として残す。"""
 
@@ -812,6 +832,31 @@ def draft_error_from_codex(error: CodexRunError) -> DraftGenerationError:
     return DraftGenerationError(error.code, messages.get(error.code, str(error)))
 
 
+def parse_hashtag_suggestions(result: str) -> list[tuple[str, str]]:
+    """Read grounded hashtag/reason pairs from the final draft section."""
+    section = re.search(
+        r"^\s*(?:#{1,6}\s*)?(?:6[.．、]\s*)?おすすめハッシュタグ\s*\n(?P<body>[\s\S]*)$",
+        result,
+        re.MULTILINE,
+    )
+    if not section:
+        return []
+    suggestions: list[tuple[str, str]] = []
+    for line in section.group("body").splitlines():
+        match = re.match(r"^\s*[-・*]?\s*(#[^\s#｜|]{1,40})\s*[｜|]\s*(.+?)\s*$", line)
+        if match:
+            suggestions.append((match.group(1), match.group(2)))
+    return suggestions
+
+
+def split_draft_hashtags(result: str) -> tuple[str, list[tuple[str, str]]]:
+    match = re.search(
+        r"\n\s*(?:#{1,6}\s*)?(?:6[.．、]\s*)?おすすめハッシュタグ\s*\n",
+        result,
+    )
+    return ((result[:match.start()].rstrip() if match else result.strip()), parse_hashtag_suggestions(result))
+
+
 def validate_note_draft(result: str, requested_length: str) -> str:
     required = ["タイトル", "軸", "見出し", "本文", "公開前チェック"]
     missing = [label for label in required if label not in result]
@@ -824,11 +869,15 @@ def validate_note_draft(result: str, requested_length: str) -> str:
         normalized_digits = digits.group(1).translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))
     desired = int(normalized_digits.replace(",", "")) if normalized_digits.replace(",", "").isdigit() else 2000
     minimum_body_length = min(800, max(250, desired // 4))
-    if missing or len(body_text.strip()) < minimum_body_length:
+    hashtags = parse_hashtag_suggestions(result)
+    normalized_tags = [tag.casefold() for tag, _ in hashtags]
+    hashtag_problem = not 3 <= len(hashtags) <= 5 or len(normalized_tags) != len(set(normalized_tags))
+    if missing or len(body_text.strip()) < minimum_body_length or hashtag_problem:
         record_local_error(
             "note_draft",
             "invalid_format",
-            f"missing={missing} body_chars={len(body_text.strip())} minimum={minimum_body_length} output={result[:2000]}",
+            f"missing={missing} body_chars={len(body_text.strip())} minimum={minimum_body_length} "
+            f"hashtag_count={len(hashtags)} duplicate={len(normalized_tags) != len(set(normalized_tags))} output={result[:2000]}",
         )
         raise DraftGenerationError(
             "invalid_format",
@@ -1059,6 +1108,178 @@ def temporary_image_uploads(parts: object) -> list[Path]:
         raise
 
 
+def read_thumbnail_image(upload: object, label: str) -> tuple[bytes, str, str]:
+    """Validate one persistent/temporary thumbnail reference before saving it."""
+    if not getattr(upload, "filename", None) or not getattr(upload, "file", None):
+        raise ValueError(f"{label}の画像ファイルを選んでください。")
+    data = upload.file.read(10_000_001)
+    if len(data) > 10_000_000:
+        raise ValueError(f"{label}は10MBまでにしてください。")
+    original_name = Path(str(upload.filename)).name
+    suffix = Path(original_name).suffix.lower()
+    valid = (
+        (suffix in {".jpg", ".jpeg"} and data.startswith(b"\xff\xd8\xff"))
+        or (suffix == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
+        or (suffix == ".webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP")
+    )
+    if not valid:
+        raise ValueError(f"{label}はPNG・JPEG・WebP形式にしてください。")
+    return data, suffix, original_name
+
+
+def thumbnail_references() -> dict[str, dict[str, str]]:
+    """Return only registered reference files that still exist on this Mac."""
+    try:
+        raw = json.loads(setting_value("thumbnail_reference_images") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for slot in ("style", "layout"):
+        item = raw.get(slot) if isinstance(raw, dict) else None
+        if not isinstance(item, dict):
+            continue
+        stored_name = str(item.get("stored_name", ""))
+        if not re.fullmatch(rf"{slot}\.(?:png|jpe?g|webp)", stored_name):
+            continue
+        path = THUMBNAIL_ASSET_DIR / stored_name
+        if path.is_file():
+            result[slot] = {"stored_name": stored_name, "original_name": str(item.get("original_name", stored_name))}
+    return result
+
+
+def save_thumbnail_settings(
+    base_prompt: str,
+    uploads: dict[str, object],
+    remove_slots: set[str],
+) -> dict[str, dict[str, str]]:
+    """Update only the two explicit persistent slots after validating every upload."""
+    validated: dict[str, tuple[bytes, str, str]] = {}
+    for slot, upload in uploads.items():
+        if slot not in {"style", "layout"}:
+            continue
+        if getattr(upload, "filename", None):
+            validated[slot] = read_thumbnail_image(upload, "画像1" if slot == "style" else "画像2")
+    current = thumbnail_references()
+    THUMBNAIL_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    updated = dict(current)
+    for slot in ("style", "layout"):
+        if slot in validated:
+            data, suffix, original_name = validated[slot]
+            stored_name = f"{slot}{suffix}"
+            with tempfile.NamedTemporaryFile(prefix=f".{slot}-", dir=THUMBNAIL_ASSET_DIR, delete=False) as output:
+                output.write(data)
+                temporary_path = Path(output.name)
+            temporary_path.replace(THUMBNAIL_ASSET_DIR / stored_name)
+            old_name = current.get(slot, {}).get("stored_name")
+            if old_name and old_name != stored_name:
+                (THUMBNAIL_ASSET_DIR / old_name).unlink(missing_ok=True)
+            updated[slot] = {"stored_name": stored_name, "original_name": original_name}
+        elif slot in remove_slots and slot in updated:
+            stored_name = updated[slot]["stored_name"]
+            (THUMBNAIL_ASSET_DIR / stored_name).unlink(missing_ok=True)
+            updated.pop(slot, None)
+    save_setting("thumbnail_base_prompt", base_prompt)
+    save_setting("thumbnail_reference_images", json.dumps(updated, ensure_ascii=False))
+    return updated
+
+
+def make_thumbnail_instruction(
+    final_article: str,
+    base_prompt: str,
+    references: dict[str, dict[str, str]],
+    extra_image: Path | None = None,
+) -> str:
+    """Create only the image instruction; actual image generation stays separate."""
+    if not final_article.strip():
+        raise ValueError("Claudeで添削した完成記事を貼ってください。")
+    if not base_prompt.strip():
+        raise ValueError("先にサムネ設定で、Obsidianの基本プロンプトを登録してください。")
+    if not all(slot in references for slot in ("style", "layout")):
+        raise ValueError("先にサムネ設定で、いつもの参考画像2枚を登録してください。")
+    images = [THUMBNAIL_ASSET_DIR / references[slot]["stored_name"] for slot in ("style", "layout")]
+    if extra_image:
+        images.append(extra_image)
+    prompt = f"""次の完成記事から、noteのサムネイル画像を作るための具体的な指示文を1つ作ってください。
+画像そのものは生成せず、画像生成へそのまま渡せる指示文だけを返してください。外部検索やファイル操作は不要です。
+
+【基本プロンプト】
+{base_prompt[:10000]}
+
+【Claudeで添削した完成記事】
+{balanced_excerpt(final_article, 24000)}
+
+【参考画像の役割】
+- 画像1は、絵柄・色・キャラクターの雰囲気の基準。内容の文字をコピーしない。
+- 画像2は、文字配置・余白・レイアウトの基準。記事と無関係な文字をコピーしない。
+{('- 画像3は、今回の記事だけの追加参考。使える要素だけを取り入れる。' if extra_image else '')}
+
+守ること:
+- 完成記事の中心テーマが一目で伝わる構図と、サムネ内に載せる短い日本語を具体的に指定する。
+- 基本プロンプトと参考画像の役割を優先し、完成記事にない成果・数字・肩書きを足さない。
+- 検索順位や閲覧数の向上を保証しない。
+- 指示文のあとに説明や前置きを付けない。"""
+    return ask_note_codex(
+        prompt,
+        timeout=THUMBNAIL_TIMEOUT,
+        model=THUMBNAIL_MODEL,
+        reasoning_effort="low",
+        images=images,
+    ).strip()
+
+
+def thumbnail_settings_page(message: str = "") -> bytes:
+    references = thumbnail_references()
+    base_prompt = setting_value("thumbnail_base_prompt")
+    status = "".join(
+        f"<article class='card'><h3>{'画像1：絵柄・色・キャラクター' if slot == 'style' else '画像2：文字配置・余白・レイアウト'}</h3>"
+        f"<p class='meta'>登録済み: {html.escape(references[slot]['original_name'])}</p>"
+        f"<label class='pick'><input type='checkbox' name='remove_{slot}' value='yes'>この画像の登録を解除する</label></article>"
+        if slot in references else
+        f"<article class='card'><h3>{'画像1：絵柄・色・キャラクター' if slot == 'style' else '画像2：文字配置・余白・レイアウト'}</h3><p class='meta'>まだ登録されていません。</p></article>"
+        for slot in ("style", "layout")
+    )
+    body = f"""
+    <header><div><p class='eyebrow'>THUMBNAIL SETTINGS</p><h1>いつものサムネ設定</h1></div><p class='sub'>ここで一度登録すると、以後のサムネ準備で自動的に毎回使います。</p></header>
+    {f"<p class='message'>{html.escape(message)}</p>" if message else ""}
+    <section class='panel'><form method='post' action='/thumbnail-settings' enctype='multipart/form-data' data-confirm-removal>
+    <label>Obsidian「note思考系サムネ基本プロンプト」</label><textarea name='base_prompt' placeholder='Obsidianのノート本文を、そのまま貼ってください。'>{html.escape(base_prompt)}</textarea>
+    <p class='hint'>Obsidian自体は書き換えません。このMacのPersonal Flowにコピーを保存します。</p>
+    {status}
+    <label>画像1を登録・差し替え</label><input name='style_image' type='file' accept='image/png,image/jpeg,image/webp'>
+    <label>画像2を登録・差し替え</label><input name='layout_image' type='file' accept='image/png,image/jpeg,image/webp'>
+    <p class='hint'>新しい画像を選ばなければ、今の登録をそのまま使います。解除は上のチェックを付けた時だけです。</p>
+    <div class='actions'><button type='submit'>この設定を保存する</button><a class='button outline' href='/thumbnail'>サムネ準備へ戻る</a></div></form></section>"""
+    return page("いつものサムネ設定", body)
+
+
+def thumbnail_prepare_page(message: str = "") -> bytes:
+    references = thumbnail_references()
+    base_prompt = setting_value("thumbnail_base_prompt")
+    article = setting_value("thumbnail_latest_article")
+    ready = bool(base_prompt and all(slot in references for slot in ("style", "layout")))
+    status = "登録済みの基本プロンプトと参考画像2枚を、毎回自動で使います。" if ready else "最初の1回だけ、基本プロンプトと参考画像2枚の登録が必要です。"
+    body = f"""
+    <header><div><p class='eyebrow'>THUMBNAIL PREPARATION</p><h1>Claude完成記事からサムネ準備</h1></div><p class='sub'>Claudeで添削を終えた完成記事は、下の欄へ貼ってください。</p></header>
+    {f"<p class='message'>{html.escape(message)}</p>" if message else ""}
+    <section class='panel'><div class='note'><strong>{html.escape(status)}</strong><br>画像1は絵柄・色・キャラクター、画像2は文字配置・余白・レイアウトの基準です。</div>
+    <div class='actions'><a class='button outline' href='/thumbnail-settings'>いつものサムネ設定を確認・変更する</a></div>
+    <form method='post' action='/thumbnail-instruction' enctype='multipart/form-data'>
+    <label>Claudeで添削した完成記事</label><textarea name='final_article' style='min-height:320px' placeholder='Claudeで完成したnote記事を、ここへ貼ってください。'>{html.escape(article)}</textarea>
+    <label>3枚目の参考画像（今回だけ・任意）</label><input name='extra_image' type='file' accept='image/png,image/jpeg,image/webp'>
+    <p class='hint'>通常は登録済みの2枚だけで大丈夫です。3枚目は、この回の指示文作成だけに使い、保存しません。</p>
+    <button class='primary' type='submit' {'disabled' if not ready else ''}>完成記事からサムネ用の画像指示文を作る</button>
+    </form><p class='hint'>ここでは画像そのものは生成しません。まず内容に合う画像指示文を作ります。</p></section>"""
+    return page("サムネ準備", body)
+
+
+def thumbnail_instruction_page(instruction: str) -> bytes:
+    body = f"""
+    <header><div><p class='eyebrow'>THUMBNAIL INSTRUCTION</p><h1>サムネ用の画像指示文</h1></div><p class='sub'>登録済みの2枚と基本プロンプト、完成記事を使って作りました。画像そのものはまだ生成していません。</p></header>
+    <section class='panel'><div class='summary'>{html.escape(instruction)}</div>
+    <div class='actions'><button class='copy' type='button' data-copy='{html.escape(instruction, quote=True)}'>画像指示文をコピー</button><a class='button outline' href='/thumbnail'>完成記事を見直す</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
+    return page("サムネ用の画像指示文", body)
+
+
 def x_post_page(result: dict[str, object]) -> bytes:
     posts = [str(post) for post in result.get("posts", [])]
     cards = "".join(
@@ -1070,6 +1291,23 @@ def x_post_page(result: dict[str, object]) -> bytes:
     <header><div><p class='eyebrow'>COPY READY</p><h1>X投稿文ができました</h1></div><p class='sub'>Xへの自動投稿はしていません。コピーして、ご自身でXへ貼り付けてください。</p></header>
     <section class='panel'><div class='note'><strong>{'1投稿' if result.get('format') == 'single' else 'スレッド投稿'}</strong><br>{html.escape(str(result.get('reason', '')))}</div>{cards}<div class='actions'><a class='button outline' href='/x-post'>別の材料で作る</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
     return page("X投稿文", body)
+
+
+def draft_result_page(result: str) -> bytes:
+    draft, hashtags = split_draft_hashtags(result)
+    hashtag_cards = "".join(
+        f"<article class='card'><h3>{html.escape(tag)}</h3><p>{html.escape(reason)}</p></article>"
+        for tag, reason in hashtags
+    )
+    copy_text = " ".join(tag for tag, _ in hashtags)
+    body = f"""
+    <header><div><p class='eyebrow'>NOTE ARTICLE DRAFT</p><h1>note記事の下書き</h1></div><p class='sub'>選んだテーマと保存記事を、note記事化フローへ渡して作った下書きです。</p></header>
+    <section class='panel'><div class='summary'>{html.escape(draft)}</div></section>
+    <section class='panel'><h2>おすすめハッシュタグ</h2>
+    <p class='hint'>note内で内容を知ってもらう入口として、記事の種類・中心テーマ・具体的な悩み・関連語などから約5個に絞りました。タイトル、見出し画像、本文、外部共有も同じように大切です。検索順位を保証するものではありません。</p>
+    {hashtag_cards}<div class='actions'><button class='copy' type='button' data-copy='{html.escape(copy_text, quote=True)}'>タグだけをまとめてコピー</button></div></section>
+    <section class='panel'><h2>Claudeで添削したあと</h2><p class='hint'>Claudeで完成した記事を貼る場所は、次の「サムネ準備」です。</p><div class='actions'><a class='button' href='/thumbnail'>完成記事を貼ってサムネ準備へ</a><a class='button outline' href='/'>保存した情報へ戻る</a></div></section>"""
+    return page("note記事の下書き", body)
 
 
 def theme_suggestion_error_page(
@@ -1209,17 +1447,22 @@ button,.button{{display:inline-flex;align-items:center;justify-content:center;bo
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid,.entry-grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
-document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate']").forEach((form) => {{
+document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate'], form[action='/thumbnail-instruction']").forEach((form) => {{
   form.addEventListener("submit", () => {{
     const button = form.querySelector("button");
     button.disabled = true;
-    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : "Youがテーマを考えています…";
+    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : form.action.endsWith("/thumbnail-instruction") ? "Youがサムネ用の画像指示文を作っています…" : "Youがテーマを考えています…";
   }});
 }});
 document.querySelectorAll("[data-copy]").forEach((button) => {{
   button.addEventListener("click", async () => {{
     await navigator.clipboard.writeText(button.dataset.copy || "");
     button.textContent = "コピーしました";
+  }});
+}});
+document.querySelectorAll("form[data-confirm-removal]").forEach((form) => {{
+  form.addEventListener("submit", (event) => {{
+    if (form.querySelector("input[name^='remove_']:checked") && !window.confirm("チェックした参考画像の登録を解除します。よろしいですか？")) event.preventDefault();
   }});
 }});
 const organizeForm = document.querySelector("#organize-form");
@@ -1251,12 +1494,18 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urlparse(self.path)
-        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize", "/thumbnail", "/thumbnail-settings"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         flow = active_flow()
         items = flow_items(flow["id"])
         query = parse_qs(route.query)
+        if route.path == "/thumbnail-settings":
+            self.send_html(thumbnail_settings_page())
+            return
+        if route.path == "/thumbnail":
+            self.send_html(thumbnail_prepare_page())
+            return
         if route.path == "/organize":
             self.send_html(organize_items_page(items))
             return
@@ -1387,7 +1636,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             ) or "<div class='empty'>まず記事を保存すると、ここに考える入口が出る。</div>"
         body = f"""
 <header><div><p class='eyebrow'>PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div><p class='sub'>流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p></header>
-<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a></section>
+<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ準備</strong><span>完成記事を貼り、いつもの設定と画像2枚を自動で使う。</span></a></section>
 <div class='grid'><section class='panel' id='save'><h2>情報をためる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
@@ -1417,6 +1666,68 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         return database().execute("SELECT * FROM direction_runs WHERE id = ?", (direction_id,)).fetchone()
 
     def do_POST(self) -> None:
+        if self.path == "/thumbnail-settings":
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data"):
+                self.send_html(thumbnail_settings_page("設定の送信方法を読み取れませんでした。もう一度試してください。"), 400)
+                return
+            try:
+                form = cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
+                )
+                uploads = {
+                    "style": form["style_image"] if "style_image" in form else None,
+                    "layout": form["layout_image"] if "layout_image" in form else None,
+                }
+                uploads = {slot: upload for slot, upload in uploads.items() if upload is not None}
+                remove_slots = {
+                    slot for slot in ("style", "layout") if form.getfirst(f"remove_{slot}", "") == "yes"
+                }
+                saved = save_thumbnail_settings(form.getfirst("base_prompt", ""), uploads, remove_slots)
+                count = sum(slot in saved for slot in ("style", "layout"))
+                self.send_html(thumbnail_settings_page(f"基本プロンプトと参考画像の設定を保存しました。登録画像は{count}枚です。"))
+            except (ValueError, OSError) as error:
+                record_local_error("thumbnail_settings", "save_failed", f"{type(error).__name__}: {error}")
+                self.send_html(thumbnail_settings_page(str(error)), 400)
+            return
+        if self.path == "/thumbnail-instruction":
+            content_type = self.headers.get("Content-Type", "")
+            extra_path: Path | None = None
+            if not content_type.startswith("multipart/form-data"):
+                self.send_html(thumbnail_prepare_page("完成記事を読み取れませんでした。もう一度貼ってください。"), 400)
+                return
+            try:
+                form = cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
+                )
+                final_article = form.getfirst("final_article", "").strip()
+                save_setting("thumbnail_latest_article", final_article)
+                extra = form["extra_image"] if "extra_image" in form else None
+                if extra is not None and getattr(extra, "filename", None):
+                    data, suffix, _ = read_thumbnail_image(extra, "3枚目の参考画像")
+                    with tempfile.NamedTemporaryFile(prefix="personal-flow-thumbnail-extra-", suffix=suffix, delete=False) as output:
+                        output.write(data)
+                        extra_path = Path(output.name)
+                instruction = make_thumbnail_instruction(
+                    final_article,
+                    setting_value("thumbnail_base_prompt"),
+                    thumbnail_references(),
+                    extra_path,
+                )
+                self.send_html(thumbnail_instruction_page(instruction))
+            except ValueError as error:
+                self.send_html(thumbnail_prepare_page(str(error)), 400)
+            except CodexRunError as error:
+                record_local_error("thumbnail_instruction", error.code, str(error))
+                self.send_html(thumbnail_prepare_page("画像指示文を作る途中で止まりました。同じ完成記事でもう一度試してください。"), 504 if error.code == "timeout" else 502)
+            finally:
+                if extra_path:
+                    extra_path.unlink(missing_ok=True)
+            return
         if self.path in {"/delete-items-confirm", "/delete-items"}:
             length = int(self.headers.get("Content-Length", "0"))
             values = parse_qs(self.rfile.read(length).decode())
@@ -1617,10 +1928,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             try:
                 draft = make_note_draft(theme, items, direction, memo, desired_length)
-                body = f"""
-                <header><div><p class='eyebrow'>NOTE ARTICLE DRAFT</p><h1>note記事の下書き</h1></div><p class='sub'>選んだテーマと保存記事を、note記事化フローへ渡して作った下書きです。</p></header>
-                <section class='panel'><div class='summary'>{html.escape(draft)}</div><div class='actions'><a class='button' href='/'>保存した情報へ戻る</a></div></section>"""
-                self.send_html(page("note記事の下書き", body))
+                self.send_html(draft_result_page(draft))
             except DraftGenerationError as error:
                 status = 504 if error.code == "timeout" else 502
                 self.send_html(
