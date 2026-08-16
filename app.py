@@ -32,6 +32,8 @@ THEME_RETRY_MODEL = os.environ.get("PERSONAL_FLOW_THEME_RETRY_MODEL", "gpt-5.6-s
 THEME_REASONING_EFFORT = os.environ.get("PERSONAL_FLOW_THEME_REASONING", "low")
 THEME_PRIMARY_TIMEOUT = 75
 THEME_RETRY_TIMEOUT = 90
+DIRECTION_PRIMARY_TIMEOUT = 75
+DIRECTION_RETRY_TIMEOUT = 90
 DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
 
 X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り始めた途中にいる人の口調にする。
@@ -51,6 +53,14 @@ class CodexRunError(RuntimeError):
 
 class ThemeSuggestionError(RuntimeError):
     """A classified failure while turning Codex output into note themes."""
+
+    def __init__(self, code: str, user_message: str):
+        super().__init__(user_message)
+        self.code = code
+
+
+class DirectionSuggestionError(RuntimeError):
+    """A classified failure while refining a chosen note direction."""
 
     def __init__(self, code: str, user_message: str):
         super().__init__(user_message)
@@ -539,15 +549,12 @@ def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[
         raise ValueError("テーマに使う情報を、少なくとも1件選んでください。")
 
     context = user_context()
-    attempts = [
-        ("primary", build_theme_prompt(selected, user_angle, context), THEME_PRIMARY_TIMEOUT, THEME_MODEL),
-        (
-            "compact_retry",
-            build_theme_prompt(selected, user_angle, context, compact=True),
-            THEME_RETRY_TIMEOUT,
-            THEME_RETRY_MODEL,
-        ),
-    ]
+    attempts = lightweight_note_attempts(
+        build_theme_prompt(selected, user_angle, context),
+        build_theme_prompt(selected, user_angle, context, compact=True),
+        THEME_PRIMARY_TIMEOUT,
+        THEME_RETRY_TIMEOUT,
+    )
     retryable = {
         "timeout",
         "process_failed",
@@ -582,6 +589,19 @@ def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[
             continue
         raise theme_error
     raise ThemeSuggestionError("unknown", "テーマを作れませんでした。もう一度試してください。")
+
+
+def lightweight_note_attempts(
+    primary_prompt: str,
+    compact_prompt: str,
+    primary_timeout: int,
+    retry_timeout: int,
+) -> list[tuple[str, str, int, str]]:
+    """Use the same isolated, low-effort profile for short note-planning tasks."""
+    return [
+        ("primary", primary_prompt, primary_timeout, THEME_MODEL),
+        ("compact_retry", compact_prompt, retry_timeout, THEME_RETRY_MODEL),
+    ]
 
 
 def note_flow_rules() -> str:
@@ -642,43 +662,111 @@ def make_note_draft(theme: dict[str, object], items: list[sqlite3.Row], memo: st
     return ask_codex(prompt, timeout=240)
 
 
-def refine_note_direction(theme: dict[str, object], items: list[sqlite3.Row], user_notes: str, previous: str = "") -> str:
-    """Develop a chosen theme with the same rules used for note drafting."""
-    sources = "\n\n".join(
-        f"【保存記事 {number}】\nタイトル: {item['title']}\n自分のメモ: {item['note'] or 'なし'}\n"
-        f"本文の抜粋: {item['article'][:3500]}"
+def build_direction_prompt(
+    theme: dict[str, object],
+    items: list[sqlite3.Row],
+    user_notes: str,
+    previous: str,
+    context: str,
+    compact: bool = False,
+) -> str:
+    """Build a small, grounded prompt for direction planning."""
+    source_numbers = {int(number) for number in theme.get("sources", []) if str(number).isdigit()}
+    numbered_items = [
+        (number, item)
         for number, item in enumerate(items, start=1)
-    )
-    prompt = f"""あなたはnote記事化フローの編集パートナーです。下書きはまだ書かず、記事の方向性を本人と一緒に固めます。
+        if not source_numbers or number in source_numbers
+    ][:3]
+    summary_limit = 450 if compact else 700
+    excerpt_limit = 350 if compact else 1000
+    note_limit = 400 if compact else 650
+    sources = "\n\n".join(
+        f"【保存記事 {number}】\n"
+        f"タイトル: {str(item['title'])[:300]}\n"
+        f"自分のメモ: {str(item['note'] or '').strip()[:note_limit] or 'なし'}\n"
+        f"要点: {str(item['summary'] or '').strip()[:summary_limit] or 'なし'}\n"
+        f"本文の短い抜粋: {str(item['article'] or '').strip()[:excerpt_limit] or 'なし'}"
+        for number, item in numbered_items
+    ) or "該当する保存記事はありません。テーマと本人メモだけを根拠にする。"
+    notes_limit = 800 if compact else 1200
+    previous_limit = 1000 if compact else 1800
+    context_limit = 400 if compact else 700
+    retry_note = "今回は短くした材料だけで判断してください。\n" if compact else ""
+    return f"""あなたはnote記事の方向性を整理する編集パートナーです。下書きはまだ書きません。
+{retry_note}以下の材料だけを使ってください。ツール、検索、ファイル操作は不要です。
 
 【選んだテーマ】
-タイトル: {theme.get('title', '')}
-何を書くか: {theme.get('approach', '')}
+タイトル: {str(theme.get('title', ''))[:300]}
+何を書くか: {str(theme.get('approach', ''))[:1200 if not compact else 750]}
 
 【本人が今書いていること】
-{user_notes or 'まだなし。本人の経験や気持ちは作らない。'}
+{user_notes[:notes_limit] or 'まだなし。本人の経験や気持ちは作らない。'}
 
 【前回までに固めた内容】
-{previous or '初回です。'}
+{previous[:previous_limit] or '初回です。'}
 
 【保存記事】
 {sources}
 
-【note記事化フローのルール】
-{note_flow_rules()}
+【本人の土台】
+{context[:context_limit] or 'まだ土台はありません。保存記事と本人メモだけを根拠にする。'}
 
-【本人のPersonal Flowの土台】
-{user_context() or 'まだ土台はありません。保存記事と本人メモだけを根拠にする。'}
+守ること:
+- 本人が話していない出来事、感情、理由、数字を作らない。
+- 本人の体験・本人の意見・保存記事の事例を混ぜない。
+- 一般論や成功物語へ広げず、本人が書ける範囲を中心にする。
+- 足りない本人の体験は補わず、質問として残す。
+- 参考記事の表現や構成をコピーしない。
 
-次の順番で、本人が次に考えやすい形にして返す。
+次の順番で、簡潔に返す。
 1. 今回の記事の中心（2〜3文）
-2. 入れると記事が本人らしくなる要素
+2. 入れると本人らしくなる要素
 3. 今回は外した方がよい要素
 4. 次に本人へ聞きたい質問（最大3つ）
-5. 今の時点での見出しのたたき台
+5. 今の時点での見出しのたたき台"""
 
-事実、本人の意見、保存記事からの読み取りを混ぜない。足りない本人の体験は質問として残す。"""
-    return ask_codex(prompt, timeout=240)
+
+def direction_error_from_codex(error: CodexRunError) -> DirectionSuggestionError:
+    messages = {
+        "timeout": "短くした材料でも方向性の整理が時間内に終わりませんでした。少ししてから、同じ内容でもう一度試してください。",
+        "start_failed": "方向性を整理する機能を起動できませんでした。詳しい原因はこのMacの記録に残しました。Personal Flowを開き直してから、もう一度試してください。",
+        "process_failed": "方向性を整理する途中でCodexが止まりました。少ししてから、同じ内容でもう一度試してください。",
+        "output_read_failed": "返ってきた方向性を読み込めませんでした。詳しい原因はこのMacの記録に残しました。もう一度試してください。",
+        "empty_output": "Codexから方向性が返ってきませんでした。同じ内容でもう一度試してください。",
+    }
+    return DirectionSuggestionError(error.code, messages.get(error.code, str(error)))
+
+
+def refine_note_direction(theme: dict[str, object], items: list[sqlite3.Row], user_notes: str, previous: str = "") -> str:
+    """Develop a chosen theme in an isolated, bounded process with one compact retry."""
+    context = user_context()
+    attempts = lightweight_note_attempts(
+        build_direction_prompt(theme, items, user_notes, previous, context),
+        build_direction_prompt(theme, items, user_notes, previous, context, compact=True),
+        DIRECTION_PRIMARY_TIMEOUT,
+        DIRECTION_RETRY_TIMEOUT,
+    )
+    retryable = {"timeout", "process_failed", "output_read_failed", "empty_output"}
+    for attempt_index, (attempt_name, prompt, timeout, model) in enumerate(attempts):
+        try:
+            return ask_codex(
+                prompt,
+                timeout=timeout,
+                model=model,
+                reasoning_effort=THEME_REASONING_EFFORT,
+                ignore_user_config=True,
+            )
+        except CodexRunError as error:
+            direction_error = direction_error_from_codex(error)
+        if attempt_index == 0 and direction_error.code in retryable:
+            record_local_error(
+                "note_direction",
+                "automatic_retry",
+                f"first_error={direction_error.code} first_prompt_chars={len(prompt)} retry_prompt_chars={len(attempts[1][1])}",
+            )
+            continue
+        raise direction_error
+    raise DirectionSuggestionError("unknown", "方向性を整理できませんでした。同じ内容でもう一度試してください。")
 
 
 def make_x_posts(material: str, images: list[Path] | None = None) -> dict[str, object]:
@@ -786,6 +874,34 @@ def theme_suggestion_error_page(
         "<a class='button outline' href='/'>保存した情報へ戻る</a></div>"
     )
     return page("テーマを作れませんでした", body)
+
+
+def direction_suggestion_error_page(
+    error: DirectionSuggestionError,
+    run_id: int,
+    theme_index: str,
+    addition: str,
+    direction_run_id: int | None = None,
+) -> bytes:
+    run_field = (
+        f"<input type='hidden' name='direction_run_id' value='{direction_run_id}'>"
+        if direction_run_id is not None
+        else f"<input type='hidden' name='run_id' value='{run_id}'>"
+    )
+    retry = (
+        "<form method='post' action='/direction'>"
+        f"{run_field}<input type='hidden' name='theme' value='{html.escape(theme_index, quote=True)}'>"
+        f"<input type='hidden' name='direction' value='{html.escape(addition, quote=True)}'>"
+        "<button type='submit'>同じ内容でもう一度試す</button></form>"
+    )
+    body = (
+        "<h1>方向性を固められませんでした</h1>"
+        f"<p class='message'>{html.escape(str(error))}</p>"
+        f"<div class='actions'>{retry}"
+        f"<a class='button outline' href='/theme-run?id={run_id}'>テーマを選ぶ画面へ戻る</a>"
+        "<a class='button outline' href='/'>保存した情報へ戻る</a></div>"
+    )
+    return page("方向性を固められませんでした", body)
 
 
 def delete_item_confirmation_page(item: sqlite3.Row) -> bytes:
@@ -1154,7 +1270,20 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 <div class='actions'><button type='submit'>追加の思いを入れて、もう一度方向性を固める</button></div></form>
                 <form method='get' action='/article-form'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{theme_index}'><input type='hidden' name='direction_run_id' value='{cursor.lastrowid}'><div class='actions'><button class='outline' type='submit'>この方向でnote記事の下書きを作る</button></div></form></section>"""
                 self.send_html(page("記事の方向性", body))
+            except DirectionSuggestionError as error:
+                status = 504 if error.code == "timeout" else 502
+                self.send_html(
+                    direction_suggestion_error_page(
+                        error,
+                        run["id"],
+                        theme_index,
+                        addition,
+                        direction_run["id"] if direction_run else None,
+                    ),
+                    status,
+                )
             except RuntimeError as error:
+                record_local_error("note_direction", "unexpected_error", f"{type(error).__name__}: {error}")
                 body = f"<h1>方向性を固められませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
                 self.send_html(page("方向性を固められませんでした", body), 400)
             return

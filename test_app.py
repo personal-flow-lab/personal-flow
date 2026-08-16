@@ -223,6 +223,85 @@ class ThemeSuggestionTests(unittest.TestCase):
         self.assertIn("本人の思い&#x27;&amp;", result)
 
 
+class DirectionSuggestionTests(unittest.TestCase):
+    def test_direction_uses_the_same_isolated_lightweight_profile(self) -> None:
+        with (
+            patch.object(app, "ask_codex", return_value="方向性") as mocked,
+            patch.object(app, "user_context", return_value=""),
+        ):
+            result = app.refine_note_direction(
+                {"title": "テーマ", "approach": "切り口", "sources": [1]},
+                [sample_item(), sample_item(2)],
+                "本人メモ",
+            )
+        self.assertEqual(result, "方向性")
+        _, kwargs = mocked.call_args
+        self.assertTrue(kwargs["ignore_user_config"])
+        self.assertEqual(kwargs["model"], app.THEME_MODEL)
+        self.assertEqual(kwargs["reasoning_effort"], "low")
+        self.assertEqual(kwargs["timeout"], app.DIRECTION_PRIMARY_TIMEOUT)
+
+    def test_direction_timeout_retries_once_with_a_smaller_prompt(self) -> None:
+        with (
+            patch.object(
+                app,
+                "ask_codex",
+                side_effect=[app.CodexRunError("timeout", "time"), "方向性"],
+            ) as mocked,
+            patch.object(app, "user_context", return_value="土台" * 1000),
+            patch.object(app, "record_local_error"),
+        ):
+            result = app.refine_note_direction(
+                {"title": "テーマ", "approach": "切り口" * 1000, "sources": [1, 2]},
+                [
+                    sample_item(article="本文" * 5000, note="メモ" * 2000),
+                    sample_item(2, article="本文" * 5000, note="メモ" * 2000),
+                ],
+                "本人メモ" * 1000,
+                "前回" * 1000,
+            )
+        self.assertEqual(result, "方向性")
+        self.assertEqual(mocked.call_count, 2)
+        primary_prompt = mocked.call_args_list[0].args[0]
+        retry_prompt = mocked.call_args_list[1].args[0]
+        self.assertLess(len(retry_prompt), len(primary_prompt))
+        self.assertEqual(mocked.call_args_list[1].kwargs["model"], app.THEME_RETRY_MODEL)
+        self.assertEqual(mocked.call_args_list[1].kwargs["timeout"], app.DIRECTION_RETRY_TIMEOUT)
+
+    def test_direction_start_failure_is_not_retried(self) -> None:
+        with (
+            patch.object(app, "ask_codex", side_effect=app.CodexRunError("start_failed", "missing")) as mocked,
+            patch.object(app, "user_context", return_value=""),
+        ):
+            with self.assertRaises(app.DirectionSuggestionError) as caught:
+                app.refine_note_direction(
+                    {"title": "テーマ", "approach": "切り口", "sources": [1]},
+                    [sample_item()],
+                    "",
+                )
+        self.assertEqual(caught.exception.code, "start_failed")
+        self.assertEqual(mocked.call_count, 1)
+
+    def test_direction_prompt_is_bounded_and_uses_only_theme_sources(self) -> None:
+        items = [
+            sample_item(1, summary="要点" * 2000, article="本文" * 5000, note="メモ" * 3000),
+            sample_item(2, summary="使わない要点", article="使わない本文", note="使わないメモ"),
+        ]
+        theme = {"title": "題", "approach": "方向" * 2000, "sources": [1]}
+        prompt = app.build_direction_prompt(theme, items, "思い" * 2000, "前回" * 2000, "土台" * 2000)
+        compact = app.build_direction_prompt(theme, items, "思い" * 2000, "前回" * 2000, "土台" * 2000, compact=True)
+        self.assertLess(len(prompt), 8_000)
+        self.assertLess(len(compact), len(prompt))
+        self.assertNotIn("使わない本文", prompt)
+
+    def test_direction_error_page_keeps_the_same_input(self) -> None:
+        error = app.DirectionSuggestionError("timeout", "時間切れです")
+        result = app.direction_suggestion_error_page(error, 19, "0", "本人の言葉'&").decode()
+        self.assertIn("同じ内容でもう一度試す", result)
+        self.assertIn("name='run_id' value='19'", result)
+        self.assertIn("本人の言葉&#x27;&amp;", result)
+
+
 class LocalLogTests(unittest.TestCase):
     def test_technical_detail_is_written_to_local_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
