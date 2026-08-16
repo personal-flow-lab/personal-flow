@@ -22,7 +22,6 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "personal-flow.db"
-NOTE_FLOW_ROOT = ROOT / "note-flow-rules"
 THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
 X_POST_SCHEMA = ROOT / "x_post_schema.json"
 DIAGNOSTIC_LOG_PATH = ROOT / "personal-flow-diagnostics.log"
@@ -34,6 +33,11 @@ THEME_PRIMARY_TIMEOUT = 75
 THEME_RETRY_TIMEOUT = 90
 DIRECTION_PRIMARY_TIMEOUT = 75
 DIRECTION_RETRY_TIMEOUT = 90
+DRAFT_MODEL = os.environ.get("PERSONAL_FLOW_DRAFT_MODEL", "gpt-5.6-sol")
+DRAFT_RETRY_MODEL = os.environ.get("PERSONAL_FLOW_DRAFT_RETRY_MODEL", "gpt-5.4-mini")
+DRAFT_REASONING_EFFORT = os.environ.get("PERSONAL_FLOW_DRAFT_REASONING", "low")
+DRAFT_PRIMARY_TIMEOUT = 180
+DRAFT_RETRY_TIMEOUT = 150
 DEFAULT_NOTE_PROFILE = "https://note.com/light_bee885"
 
 X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り始めた途中にいる人の口調にする。
@@ -61,6 +65,14 @@ class ThemeSuggestionError(RuntimeError):
 
 class DirectionSuggestionError(RuntimeError):
     """A classified failure while refining a chosen note direction."""
+
+    def __init__(self, code: str, user_message: str):
+        super().__init__(user_message)
+        self.code = code
+
+
+class DraftGenerationError(RuntimeError):
+    """A classified failure while creating a note draft."""
 
     def __init__(self, code: str, user_message: str):
         super().__init__(user_message)
@@ -209,14 +221,59 @@ def flow_item(flow_id: int, item_id: str) -> sqlite3.Row | None:
 
 
 def delete_flow_item(flow_id: int, item_id: str) -> bool:
-    if not item_id.isdigit():
-        return False
-    with database() as connection:
+    return len(delete_flow_items(flow_id, [item_id])) == 1
+
+
+def exact_item_ids(item_ids: list[str]) -> list[int] | None:
+    """Reject empty, invalid, or duplicate IDs instead of silently widening a delete."""
+    if not item_ids or any(not item_id.isdigit() for item_id in item_ids):
+        return None
+    ids = [int(item_id) for item_id in item_ids]
+    return ids if len(ids) == len(set(ids)) else None
+
+
+def exact_flow_items(flow_id: int, item_ids: list[str]) -> list[sqlite3.Row]:
+    ids = exact_item_ids(item_ids)
+    if ids is None:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    rows = database().execute(
+        f"SELECT * FROM items WHERE flow_id = ? AND id IN ({placeholders}) ORDER BY id DESC",
+        [flow_id, *ids],
+    ).fetchall()
+    if len(rows) != len(ids):
+        return []
+    by_id = {row["id"]: row for row in rows}
+    return [by_id[item_id] for item_id in ids]
+
+
+def delete_flow_items(flow_id: int, item_ids: list[str]) -> list[sqlite3.Row]:
+    """Atomically delete the whole confirmed set, or delete nothing."""
+    ids = exact_item_ids(item_ids)
+    if ids is None:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    connection = database()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        items = connection.execute(
+            f"SELECT * FROM items WHERE flow_id = ? AND id IN ({placeholders}) ORDER BY id DESC",
+            [flow_id, *ids],
+        ).fetchall()
+        if len(items) != len(ids):
+            connection.rollback()
+            return []
         cursor = connection.execute(
-            "DELETE FROM items WHERE id = ? AND flow_id = ?",
-            (int(item_id), flow_id),
+            f"DELETE FROM items WHERE flow_id = ? AND id IN ({placeholders})",
+            [flow_id, *ids],
         )
-    return cursor.rowcount == 1
+        if cursor.rowcount != len(items):
+            connection.rollback()
+            return []
+        connection.commit()
+        return items
+    finally:
+        connection.close()
 
 
 def start_next_flow(previous: sqlite3.Row, keep: bool) -> None:
@@ -421,6 +478,24 @@ def ask_codex(
             record_local_error("codex", "temp_cleanup_failed", f"{type(error).__name__}: {error}")
 
 
+def ask_note_codex(
+    prompt: str,
+    timeout: int,
+    model: str,
+    reasoning_effort: str,
+    schema: Path | None = None,
+) -> str:
+    """Run every article-planning step with the isolated note profile."""
+    return ask_codex(
+        prompt,
+        timeout=timeout,
+        schema=schema,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        ignore_user_config=True,
+    )
+
+
 def build_theme_prompt(
     selected: list[sqlite3.Row],
     user_angle: str,
@@ -531,6 +606,36 @@ def parse_theme_proposal(raw_proposal: str, source_count: int) -> list[dict[str,
     return result
 
 
+def attach_theme_source_ids(
+    themes: list[dict[str, object]],
+    items: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Persist stable item IDs so later deletions cannot shift source numbering."""
+    for theme in themes:
+        theme["source_item_ids"] = [items[number - 1]["id"] for number in theme["sources"]]
+    return themes
+
+
+def referenced_theme_items(
+    theme: dict[str, object],
+    items: list[sqlite3.Row],
+) -> list[tuple[int, sqlite3.Row]]:
+    """Resolve sources by stable ID, with a safe legacy fallback to original order."""
+    stable_ids = theme.get("source_item_ids")
+    if isinstance(stable_ids, list) and stable_ids:
+        wanted = {int(item_id) for item_id in stable_ids if str(item_id).isdigit()}
+        if len(wanted) != len(stable_ids):
+            return []
+        matched = [(number, item) for number, item in enumerate(items, start=1) if item["id"] in wanted]
+        return matched if len(matched) == len(wanted) else []
+    source_numbers = {int(number) for number in theme.get("sources", []) if str(number).isdigit()}
+    return [
+        (number, item)
+        for number, item in enumerate(items, start=1)
+        if not source_numbers or number in source_numbers
+    ]
+
+
 def theme_error_from_codex(error: CodexRunError) -> ThemeSuggestionError:
     messages = {
         "timeout": "短くした材料でもテーマ作成が時間内に終わりませんでした。少ししてから、もう一度試してください。",
@@ -567,15 +672,14 @@ def suggest_note_themes(items: list[sqlite3.Row], user_angle: str = "") -> list[
     }
     for attempt_index, (attempt_name, prompt, timeout, model) in enumerate(attempts):
         try:
-            raw_proposal = ask_codex(
+            raw_proposal = ask_note_codex(
                 prompt,
                 timeout=timeout,
                 schema=THEME_SCHEMA,
                 model=model,
                 reasoning_effort=THEME_REASONING_EFFORT,
-                ignore_user_config=True,
             )
-            return parse_theme_proposal(raw_proposal, len(selected))
+            return attach_theme_source_ids(parse_theme_proposal(raw_proposal, len(selected)), selected)
         except CodexRunError as error:
             theme_error = theme_error_from_codex(error)
         except ThemeSuggestionError as error:
@@ -604,51 +708,87 @@ def lightweight_note_attempts(
     ]
 
 
-def note_flow_rules() -> str:
-    files = [
-        "outputs/Brain_Codex_note1万円/文章ルール.md",
-        "note記事生成ルール.md",
-        "outputs/Brain_Codex_note1万円/10_現在地.md",
-    ]
-    try:
-        return "\n\n".join(
-            f"【{file}】\n{(NOTE_FLOW_ROOT / file).read_text(encoding='utf-8')}"
-            for file in files
-        )
-    except OSError as error:
-        raise RuntimeError("note記事化フローのルールを読めませんでした。") from error
+def draft_rules_digest() -> str:
+    """Keep the essential note-flow rules without loading the full development files."""
+    return """- 今回の本人メモと個別の指定を最優先する。
+- 本人が話していない出来事、感情、理由、経歴、数字を作らない。
+- 本人の事実・本人の意見・推測・保存記事の事例を混ぜない。
+- 自分が見たこと、試したこと、現場で迷ったことを記事の中心にする。
+- 本人の自然な話し方と、考えている途中の感じを整えすぎない。
+- 専門用語は普通の言葉で説明し、抽象論だけにしない。
+- 参考記事の表現、文体、構成をコピーしない。記事名も勝手に本文へ出さない。
+- 社会論、人生論、成功物語へ勝手に広げず、自分の場合へ戻す。
+- 同じ説明で文字数を水増ししない。一般論より具体的な事実と本音を残す。
+- 標準はタイトル案3つ、H2見出し2〜3個。最後に新しい教訓や読者への励ましを足さない。"""
 
 
-def make_note_draft(theme: dict[str, object], items: list[sqlite3.Row], memo: str, length: str) -> str:
-    source_numbers = {int(number) for number in theme.get("sources", []) if str(number).isdigit()}
-    source_items = [item for number, item in enumerate(items, start=1) if number in source_numbers]
-    if not source_items:
-        source_items = items[:3]
-    sources = "\n\n".join(
-        f"【保存記事 {number}】\nタイトル: {item['title']}\nURL: {item['url']}\n"
-        f"自分のメモ: {item['note'] or 'なし'}\n本文の抜粋: {item['article'][:5000]}"
-        for number, item in enumerate(source_items, start=1)
+def balanced_excerpt(value: str, limit: int) -> str:
+    """Keep the beginning, a middle example, and the ending conclusion."""
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    segment = max(1, (limit - 30) // 3)
+    middle_start = max(0, (len(text) - segment) // 2)
+    return (
+        f"[冒頭]\n{text[:segment]}\n"
+        f"[中盤]\n{text[middle_start:middle_start + segment]}\n"
+        f"[末尾]\n{text[-segment:]}"
     )
-    prompt = f"""あなたはnote記事化フローの実行役です。以下のルールを守り、Personal Flowから渡されたテーマを記事の下書きにしてください。
+
+
+def build_draft_prompt(
+    theme: dict[str, object],
+    items: list[sqlite3.Row],
+    direction: str,
+    user_memo: str,
+    length: str,
+    context: str,
+    compact: bool = False,
+) -> str:
+    """Build a quality-preserving but bounded prompt for a full note draft."""
+    numbered_items = referenced_theme_items(theme, items)[:4]
+    summary_limit = 900 if compact else 1400
+    excerpt_limit = 1800 if compact else 3200
+    note_limit = 900 if compact else 1200
+    sources = "\n\n".join(
+        f"【保存記事 {number}】\n"
+        f"タイトル: {str(item['title'])[:300]}\n"
+        f"自分のメモ: {balanced_excerpt(str(item['note'] or ''), note_limit) or 'なし'}\n"
+        f"要点: {balanced_excerpt(str(item['summary'] or ''), summary_limit) or 'なし'}\n"
+        f"本文の冒頭・中盤・末尾: {balanced_excerpt(str(item['article'] or ''), excerpt_limit) or 'なし'}"
+        for number, item in numbered_items
+    ) or "該当する保存記事はありません。テーマと本人メモだけを根拠にする。"
+    direction_limit = 3500 if compact else 5000
+    memo_limit = 1800 if compact else 2800
+    context_limit = 900 if compact else 1200
+    approach_limit = 1200 if compact else 1800
+    retry_note = "今回は短くした材料を使い、内容を広げすぎず完成させてください。\n" if compact else ""
+    return f"""あなたはnote記事化フローの実行役です。
+{retry_note}以下の材料だけを使い、指定された長さの記事の下書きを作ってください。ツール、検索、ファイル操作は不要です。
 
 【選ばれたテーマ】
-タイトル: {theme.get('title', '')}
-何を書くか: {theme.get('approach', '')}
+タイトル: {str(theme.get('title', ''))[:300]}
+何を書くか: {str(theme.get('approach', ''))[:approach_limit]}
+この組み合わせを選んだ理由: {str(theme.get('picked', ''))[:1000]}
+今回は外す要素: {str(theme.get('left_out', ''))[:1000]}
+
+【固めた方向性】
+{direction[:direction_limit] or 'まだ方向性の追加情報はありません。'}
 
 【本人の追加メモ】
-{memo or 'まだ追加メモはありません。保存記事から分かる事実だけを使い、足りない本人の体験は作らない。'}
+{user_memo[:memo_limit] or 'まだ追加メモはありません。保存記事から分かる事実だけを使い、足りない本人の体験は作らない。'}
 
 【希望文字数】
-{length or '約2,000字'}
+{length[:100] or '約2,000字'}
 
 【保存記事】
 {sources}
 
-【note記事化フローのルール】
-{note_flow_rules()}
+【記事づくりの重要ルール】
+{draft_rules_digest()}
 
-【本人のPersonal Flowの土台】
-{user_context() or 'まだ土台はありません。保存記事と本人メモだけを根拠にする。'}
+【本人の土台】
+{context[:context_limit] or 'まだ土台はありません。保存記事と本人メモだけを根拠にする。'}
 
 出力順:
 1. タイトル案3つ
@@ -658,8 +798,93 @@ def make_note_draft(theme: dict[str, object], items: list[sqlite3.Row], memo: st
 5. 公開前チェック
 6. ハッシュタグ案
 
-保存記事は参考材料であり、記事の表現や構成をコピーしない。本人の事実・本人の意見・保存記事の事例を混ぜない。"""
-    return ask_codex(prompt, timeout=240)
+本人の材料が足りない部分は作らず、本文内で断定しないか、公開前チェックに確認事項として残す。"""
+
+
+def draft_error_from_codex(error: CodexRunError) -> DraftGenerationError:
+    messages = {
+        "timeout": "短くした材料でも下書きが時間内に完成しませんでした。少ししてから、同じ内容でもう一度試してください。",
+        "start_failed": "下書きを作る機能を起動できませんでした。詳しい原因はこのMacの記録に残しました。Personal Flowを開き直してから、もう一度試してください。",
+        "process_failed": "下書きを作る途中でCodexが止まりました。少ししてから、同じ内容でもう一度試してください。",
+        "output_read_failed": "返ってきた下書きを読み込めませんでした。詳しい原因はこのMacの記録に残しました。もう一度試してください。",
+        "empty_output": "Codexから下書きが返ってきませんでした。同じ内容でもう一度試してください。",
+    }
+    return DraftGenerationError(error.code, messages.get(error.code, str(error)))
+
+
+def validate_note_draft(result: str, requested_length: str) -> str:
+    required = ["タイトル", "軸", "見出し", "本文", "公開前チェック"]
+    missing = [label for label in required if label not in result]
+    body_start = result.find("本文")
+    check_start = result.find("公開前チェック", body_start + 2) if body_start >= 0 else -1
+    body_text = result[body_start + 2:check_start] if body_start >= 0 and check_start > body_start else ""
+    digits = re.search(r"([0-9０-９,，]+)", requested_length)
+    normalized_digits = ""
+    if digits:
+        normalized_digits = digits.group(1).translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))
+    desired = int(normalized_digits.replace(",", "")) if normalized_digits.replace(",", "").isdigit() else 2000
+    minimum_body_length = min(800, max(250, desired // 4))
+    if missing or len(body_text.strip()) < minimum_body_length:
+        record_local_error(
+            "note_draft",
+            "invalid_format",
+            f"missing={missing} body_chars={len(body_text.strip())} minimum={minimum_body_length} output={result[:2000]}",
+        )
+        raise DraftGenerationError(
+            "invalid_format",
+            "下書きに必要な項目や本文の長さがそろいませんでした。同じ内容でもう一度試してください。",
+        )
+    return result
+
+
+def make_note_draft(
+    theme: dict[str, object],
+    items: list[sqlite3.Row],
+    direction: str,
+    user_memo: str,
+    length: str,
+) -> str:
+    """Create a full draft in an isolated process, with one smaller automatic retry."""
+    context = user_context()
+    attempts = [
+        (
+            "primary",
+            build_draft_prompt(theme, items, direction, user_memo, length, context),
+            DRAFT_PRIMARY_TIMEOUT,
+            DRAFT_MODEL,
+        ),
+        (
+            "compact_retry",
+            build_draft_prompt(theme, items, direction, user_memo, length, context, compact=True),
+            DRAFT_RETRY_TIMEOUT,
+            DRAFT_RETRY_MODEL,
+        ),
+    ]
+    retryable = {"timeout", "process_failed", "output_read_failed", "empty_output", "invalid_format"}
+    for attempt_index, (attempt_name, prompt, timeout, model) in enumerate(attempts):
+        try:
+            return validate_note_draft(
+                ask_note_codex(
+                    prompt,
+                    timeout=timeout,
+                    model=model,
+                    reasoning_effort=DRAFT_REASONING_EFFORT,
+                ),
+                length,
+            )
+        except CodexRunError as error:
+            draft_error = draft_error_from_codex(error)
+        except DraftGenerationError as error:
+            draft_error = error
+        if attempt_index == 0 and draft_error.code in retryable:
+            record_local_error(
+                "note_draft",
+                "automatic_retry",
+                f"first_error={draft_error.code} first_prompt_chars={len(prompt)} retry_prompt_chars={len(attempts[1][1])}",
+            )
+            continue
+        raise draft_error
+    raise DraftGenerationError("unknown", "下書きを作れませんでした。同じ内容でもう一度試してください。")
 
 
 def build_direction_prompt(
@@ -671,12 +896,7 @@ def build_direction_prompt(
     compact: bool = False,
 ) -> str:
     """Build a small, grounded prompt for direction planning."""
-    source_numbers = {int(number) for number in theme.get("sources", []) if str(number).isdigit()}
-    numbered_items = [
-        (number, item)
-        for number, item in enumerate(items, start=1)
-        if not source_numbers or number in source_numbers
-    ][:3]
+    numbered_items = referenced_theme_items(theme, items)[:3]
     summary_limit = 450 if compact else 700
     excerpt_limit = 350 if compact else 1000
     note_limit = 400 if compact else 650
@@ -749,12 +969,11 @@ def refine_note_direction(theme: dict[str, object], items: list[sqlite3.Row], us
     retryable = {"timeout", "process_failed", "output_read_failed", "empty_output"}
     for attempt_index, (attempt_name, prompt, timeout, model) in enumerate(attempts):
         try:
-            return ask_codex(
+            return ask_note_codex(
                 prompt,
                 timeout=timeout,
                 model=model,
                 reasoning_effort=THEME_REASONING_EFFORT,
-                ignore_user_config=True,
             )
         except CodexRunError as error:
             direction_error = direction_error_from_codex(error)
@@ -904,16 +1123,74 @@ def direction_suggestion_error_page(
     return page("方向性を固められませんでした", body)
 
 
-def delete_item_confirmation_page(item: sqlite3.Row) -> bytes:
+def draft_generation_error_page(
+    error: DraftGenerationError,
+    run_id: int,
+    theme_index: str,
+    direction: str,
+    memo: str,
+    length: str,
+) -> bytes:
+    retry = (
+        "<form method='post' action='/draft'>"
+        f"<input type='hidden' name='run_id' value='{run_id}'>"
+        f"<input type='hidden' name='theme' value='{html.escape(theme_index, quote=True)}'>"
+        f"<input type='hidden' name='direction' value='{html.escape(direction, quote=True)}'>"
+        f"<input type='hidden' name='memo' value='{html.escape(memo, quote=True)}'>"
+        f"<input type='hidden' name='length' value='{html.escape(length, quote=True)}'>"
+        "<button type='submit'>同じ内容でもう一度試す</button></form>"
+    )
+    body = (
+        "<h1>下書きを作れませんでした</h1>"
+        f"<p class='message'>{html.escape(str(error))}</p>"
+        f"<div class='actions'>{retry}"
+        f"<a class='button outline' href='/article-form?run_id={run_id}&theme={html.escape(theme_index, quote=True)}'>メモを見直す</a>"
+        "<a class='button outline' href='/'>保存した情報へ戻る</a></div>"
+    )
+    return page("下書きを作れませんでした", body)
+
+
+def organize_items_page(items: list[sqlite3.Row]) -> bytes:
+    cards = "".join(
+        f"<article class='card'><label class='pick'><input type='checkbox' name='item_ids' value='{item['id']}'>この情報を整理対象にする</label>"
+        f"<div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
+        f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
+        f"<div class='summary'>{html.escape(item['summary'])}</div></article>"
+        for item in items
+    ) or "<div class='empty'>整理する情報はありません。</div>"
     body = f"""
-    <header><div><p class='eyebrow'>CHECK BEFORE DELETE</p><h1>この情報を削除しますか？</h1></div><p class='sub'>まだ削除されていません。対象を確認してから決められます。</p></header>
-    <section class='panel'><p class='message'><strong>この操作は元に戻せません。</strong><br>この1件だけが、今回の記事の箱から削除されます。</p>
-    <article class='card'><div class='meta'>{html.escape(item['created_at'])}</div><h2>{html.escape(item['title'])}</h2>
-    <a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>
-    <div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div></article>
-    <div class='actions'><form method='post' action='/delete-item'><input type='hidden' name='item_id' value='{item['id']}'><button class='danger' type='submit'>確認したので、この1件を削除する</button></form>
-    <a class='button outline' href='/'>削除せずに戻る</a></div></section>"""
+    <header><div><p class='eyebrow'>ORGANIZE INFORMATION</p><h1>不要な情報を整理する</h1></div><p class='sub'>消したい情報を複数選び、次の画面で対象をもう一度確認できます。</p></header>
+    <form id='organize-form' method='post' action='/delete-items-confirm'><section class='panel'>{cards}
+    <div class='actions'><button id='organize-submit' class='danger' type='submit' disabled>選んだ0件を削除</button><a class='button outline' href='/'>整理せずに戻る</a></div>
+    <p class='hint'>この画面ではまだ削除されません。確認画面の最後のボタンを押した時だけ削除されます。</p></section></form>"""
+    return page("不要な情報を整理する", body)
+
+
+def delete_items_confirmation_page(flow_id: int, items: list[sqlite3.Row]) -> bytes:
+    hidden_ids = "".join(f"<input type='hidden' name='item_ids' value='{item['id']}'>" for item in items)
+    cards = "".join(
+        f"<article class='card'><div class='meta'>{html.escape(item['created_at'])}</div>"
+        f"<h3>{html.escape(item['title'])}</h3>"
+        f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a></article>"
+        for item in items
+    )
+    count = len(items)
+    body = f"""
+    <header><div><p class='eyebrow'>CHECK BEFORE DELETE</p><h1>選んだ{count}件を削除しますか？</h1></div><p class='sub'>まだ削除されていません。記事名を確認してから決められます。</p></header>
+    <section class='panel'><p class='message'><strong>この操作は元に戻せません。</strong><br>下の{count}件だけが、今回の記事の箱から削除されます。</p>{cards}
+    <div class='actions'><form method='post' action='/delete-items'><input type='hidden' name='flow_id' value='{flow_id}'>{hidden_ids}<button class='danger' type='submit'>確認したので、選んだ{count}件を削除する</button></form>
+    <a class='button outline' href='/organize'>選び直す</a><a class='button outline' href='/'>削除せずに戻る</a></div></section>"""
     return page("削除する情報の確認", body)
+
+
+def missing_theme_sources_page() -> bytes:
+    body = (
+        "<h1>テーマの元になった情報が見つかりません</h1>"
+        "<p class='message'>テーマを作った後に情報が整理された可能性があります。別の記事を根拠にしないよう、ここで停止しました。</p>"
+        "<div class='actions'><a class='button' href='/choose-sources'>今の情報から選び直す</a>"
+        "<a class='button outline' href='/'>保存した情報へ戻る</a></div>"
+    )
+    return page("情報を選び直してください", body)
 
 
 def page(title: str, body: str) -> bytes:
@@ -927,7 +1204,7 @@ main{{max-width:1180px;margin:0 auto;padding:46px 24px 72px}} header{{display:fl
 h1{{font-size:42px;letter-spacing:-.05em;margin:0}} h2{{font-size:18px;margin:0 0 14px}} h3{{font-size:16px;margin:0 0 7px}} .eyebrow{{color:var(--green);font-weight:800;font-size:12px;letter-spacing:.08em;margin:0 0 6px}} .sub{{color:var(--muted);max-width:460px;margin:0;font-size:14px}}
 .grid{{display:grid;grid-template-columns:minmax(310px,.9fr) minmax(390px,1.25fr);gap:20px;align-items:start}} .panel,.card{{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 8px 22px #25251a09}} .panel{{padding:22px}} .card{{padding:18px;margin-top:12px}}
 label{{display:block;font-weight:750;font-size:13px;margin-top:15px}} input,textarea{{width:100%;font:inherit;border:1px solid #cac7bd;border-radius:9px;padding:12px;background:#fff;margin-top:6px}} textarea{{min-height:100px;resize:vertical}}
-button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button.primary{{background:var(--green);width:100%;margin-top:18px}} button.danger{{background:#a3342e}} .danger-outline{{background:transparent;color:#8c2f2a;border:1px solid #cda5a1}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
+button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button:disabled{{opacity:.45;cursor:not-allowed}} button.primary{{background:var(--green);width:100%;margin-top:18px}} button.danger{{background:#a3342e}} .danger-outline{{background:transparent;color:#8c2f2a;border:1px solid #cda5a1}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
 .section-head{{display:flex;justify-content:space-between;align-items:center;gap:12px}} .count{{font-size:12px;color:var(--muted);background:#edebe5;border-radius:99px;padding:3px 8px}} .meta{{font-size:12px;color:var(--muted)}} .summary{{white-space:pre-wrap;font-size:14px;margin:12px 0}} .note{{background:#f2f5ef;border-radius:8px;padding:10px 12px;font-size:13px}} a{{color:var(--green)}} .empty{{color:var(--muted);padding:24px 0;text-align:center}}
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid,.entry-grid{{grid-template-columns:1fr}}}}
@@ -945,6 +1222,20 @@ document.querySelectorAll("[data-copy]").forEach((button) => {{
     button.textContent = "コピーしました";
   }});
 }});
+const organizeForm = document.querySelector("#organize-form");
+if (organizeForm) {{
+  const organizeButton = organizeForm.querySelector("#organize-submit");
+  const updateSelection = () => {{
+    const count = organizeForm.querySelectorAll("input[name='item_ids']:checked").length;
+    organizeButton.disabled = count === 0;
+    organizeButton.textContent = `選んだ${{count}}件を削除`;
+  }};
+  organizeForm.addEventListener("change", updateSelection);
+  organizeForm.addEventListener("submit", (event) => {{
+    if (!organizeForm.querySelector("input[name='item_ids']:checked")) event.preventDefault();
+  }});
+  updateSelection();
+}}
 </script></body></html>""".encode()
 
 
@@ -960,12 +1251,15 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urlparse(self.path)
-        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         flow = active_flow()
         items = flow_items(flow["id"])
         query = parse_qs(route.query)
+        if route.path == "/organize":
+            self.send_html(organize_items_page(items))
+            return
         if route.path == "/finish":
             body = f"""
             <header><div><p class='eyebrow'>FINISH THIS ARTICLE</p><h1>今回の記事を終える</h1></div><p class='sub'>今の{len(items)}件を、次の記事の材料に混ぜないための区切りです。</p></header>
@@ -1028,7 +1322,11 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             proposal = json.loads(run["proposal_json"])
             selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
-            source_count = len(selected_flow_items(run["flow_id"], selected_ids))
+            run_items = exact_flow_items(run["flow_id"], selected_ids)
+            if not run_items:
+                self.send_html(missing_theme_sources_page(), 409)
+                return
+            source_count = len(run_items)
             user_angle = str(proposal.get("user_angle", "")).strip()
             theme_cards = "".join(
                 f"<article class='card theme'><h3>{html.escape(str(theme['title']))}</h3>"
@@ -1053,6 +1351,11 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             if not run or not theme:
                 self.send_html(page("見つかりません", "<h1>選んだテーマが見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
                 return
+            proposal = json.loads(run["proposal_json"])
+            selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
+            if not exact_flow_items(run["flow_id"], selected_ids):
+                self.send_html(missing_theme_sources_page(), 409)
+                return
             direction = query.get("direction", [""])[0].strip()
             direction_run = self.load_direction_run(query)
             if direction_run:
@@ -1072,8 +1375,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
             f"<div class='summary'>{html.escape(item['summary'])}</div>"
             f"<div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div>"
-            f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form>"
-            f"<form method='post' action='/delete-item-confirm' class='inline-form'><input type='hidden' name='item_id' value='{item['id']}'><button class='danger-outline' type='submit'>この情報を削除</button></form></div></article>"
+            f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form></div></article>"
             for item in items
         ) or "<div class='empty'>まだ何もありません。最初のURLを入れてみよう。</div>"
         theme_cards = ""
@@ -1089,7 +1391,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 <div class='grid'><section class='panel' id='save'><h2>情報をためる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
-<section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/context'>自分の土台を見直す</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
+<section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/organize'>不要な情報を整理する</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/context'>自分の土台を見直す</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
         self.send_html(page("情報受け箱", body))
 
     def load_theme_run(self, query: dict[str, list[str]]) -> sqlite3.Row | None:
@@ -1115,24 +1417,30 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         return database().execute("SELECT * FROM direction_runs WHERE id = ?", (direction_id,)).fetchone()
 
     def do_POST(self) -> None:
-        if self.path in {"/delete-item-confirm", "/delete-item"}:
+        if self.path in {"/delete-items-confirm", "/delete-items"}:
             length = int(self.headers.get("Content-Length", "0"))
             values = parse_qs(self.rfile.read(length).decode())
-            item_id = values.get("item_id", [""])[0]
+            item_ids = values.get("item_ids", [])
             flow = active_flow()
-            item = flow_item(flow["id"], item_id)
-            if not item:
-                body = "<h1>削除する情報が見つかりません</h1><p class='message'>すでに削除されたか、記事の箱が切り替わった可能性があります。</p><p><a class='button' href='/'>今の情報へ戻る</a></p>"
-                self.send_html(page("情報が見つかりません", body), 404)
+            if self.path == "/delete-items-confirm":
+                items = exact_flow_items(flow["id"], item_ids)
+                if not items:
+                    body = "<h1>整理する情報が選ばれていません</h1><p class='message'>削除したい情報を1件以上選んでください。不正な選択や重複がある場合も、安全のため先へ進みません。</p><p><a class='button' href='/organize'>整理する画面へ戻る</a></p>"
+                    self.send_html(page("情報を選んでください", body), 400)
+                    return
+                self.send_html(delete_items_confirmation_page(flow["id"], items))
                 return
-            if self.path == "/delete-item-confirm":
-                self.send_html(delete_item_confirmation_page(item))
+            confirmed_flow_id = values.get("flow_id", [""])[0]
+            if not confirmed_flow_id.isdigit() or int(confirmed_flow_id) != flow["id"]:
+                body = "<h1>削除を中止しました</h1><p class='message'>確認後に記事の箱が切り替わったため、何も削除していません。今の情報から選び直してください。</p><p><a class='button' href='/organize'>今の情報を整理する</a></p>"
+                self.send_html(page("削除を中止しました", body), 409)
                 return
-            if not delete_flow_item(flow["id"], item_id):
-                body = "<h1>削除できませんでした</h1><p class='message'>対象が見つからなかったため、何も削除していません。</p><p><a class='button' href='/'>今の情報へ戻る</a></p>"
+            deleted = delete_flow_items(flow["id"], item_ids)
+            if not deleted:
+                body = "<h1>削除を中止しました</h1><p class='message'>確認後に対象が変わった、すでに整理された、または選択内容が正しくないため、1件も削除していません。</p><p><a class='button' href='/organize'>今の情報から選び直す</a></p>"
                 self.send_html(page("削除できませんでした", body), 409)
                 return
-            body = f"<h1>1件だけ削除しました</h1><p class='message'>「{html.escape(item['title'])}」を今回の記事の箱から削除しました。</p><p><a class='button' href='/'>今の情報へ戻る</a></p>"
+            body = f"<h1>選んだ{len(deleted)}件を削除しました</h1><p class='message'>今回の記事の箱から、確認した{len(deleted)}件だけを削除しました。</p><p><a class='button' href='/'>情報の一覧へ戻る</a></p>"
             self.send_html(page("情報を削除しました", body))
             return
         if self.path == "/x-generate":
@@ -1250,7 +1558,10 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             proposal = json.loads(run["proposal_json"])
             selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
-            items = selected_flow_items(run["flow_id"], selected_ids)
+            items = exact_flow_items(run["flow_id"], selected_ids)
+            if not items or not referenced_theme_items(theme, items):
+                self.send_html(missing_theme_sources_page(), 409)
+                return
             addition = values.get("direction", [""])[0].strip()
             prior_notes = direction_run["direction_notes"] if direction_run else ""
             combined_notes = "\n\n".join(part for part in [prior_notes, addition] if part)
@@ -1300,16 +1611,32 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             desired_length = values.get("length", [""])[0].strip()
             proposal = json.loads(run["proposal_json"])
             selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
-            items = selected_flow_items(run["flow_id"], selected_ids)
+            items = exact_flow_items(run["flow_id"], selected_ids)
+            if not items or not referenced_theme_items(theme, items):
+                self.send_html(missing_theme_sources_page(), 409)
+                return
             try:
-                combined_memo = "\n\n".join(part for part in [direction, memo] if part)
-                draft = make_note_draft(theme, items, combined_memo, desired_length)
+                draft = make_note_draft(theme, items, direction, memo, desired_length)
                 body = f"""
                 <header><div><p class='eyebrow'>NOTE ARTICLE DRAFT</p><h1>note記事の下書き</h1></div><p class='sub'>選んだテーマと保存記事を、note記事化フローへ渡して作った下書きです。</p></header>
                 <section class='panel'><div class='summary'>{html.escape(draft)}</div><div class='actions'><a class='button' href='/'>保存した情報へ戻る</a></div></section>"""
                 self.send_html(page("note記事の下書き", body))
+            except DraftGenerationError as error:
+                status = 504 if error.code == "timeout" else 502
+                self.send_html(
+                    draft_generation_error_page(
+                        error,
+                        run["id"],
+                        values.get("theme", [""])[0],
+                        direction,
+                        memo,
+                        desired_length,
+                    ),
+                    status,
+                )
             except RuntimeError as error:
-                body = f"<h1>下書きを作れませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/'>保存した情報へ戻る</a></p>"
+                record_local_error("note_draft", "unexpected_error", f"{type(error).__name__}: {error}")
+                body = f"<h1>下書きを作れませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/article-form?run_id={run['id']}&theme={values.get('theme', [''])[0]}'>記事にする前のメモへ戻る</a></p>"
                 self.send_html(page("下書きを作れませんでした", body), 400)
             return
         if self.path != "/save":
