@@ -134,6 +134,7 @@ class PastedArticleSaveTests(unittest.TestCase):
         self.assertIn("action='/save'", page)
         self.assertIn("action='/save-pasted-article'", page)
         self.assertIn("URLや外部ページは読み込みません", page)
+        self.assertIn("今日の記事情報", page)
         self.assertLess(page.index("URLから情報をためる"), page.index("完成した記事から始める"))
 
     def test_pasted_article_saves_without_fetching_and_joins_current_flow(self) -> None:

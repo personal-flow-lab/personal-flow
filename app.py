@@ -2054,7 +2054,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
 <section class='panel'><h2>完成した記事から始める</h2><p class='hint'>自分で書き上げた記事本文を貼ります。URLや外部ページは読み込みません。</p>
 <form method='post' action='/save-pasted-article'><label>完成した記事を貼り付ける</label><textarea name='article' style='min-height:280px' placeholder='完成した記事を、タイトルから本文の最後まで貼ってください。' required></textarea>
 <button class='primary' type='submit'>完成記事を保存して要点を見る</button></form></section></div>
-<section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/organize'>不要な情報を整理する</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/context'>自分の土台を見直す</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
+<section class='panel'><div class='section-head'><h2>今日の記事情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/organize'>不要な情報を整理する</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/context'>自分の土台を見直す</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
         self.send_html(page("情報受け箱", body))
 
     def load_theme_run(self, query: dict[str, list[str]]) -> sqlite3.Row | None:
