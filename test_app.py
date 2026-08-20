@@ -278,6 +278,132 @@ class CodexFailureTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "process_failed")
 
 
+class XPostGenerationTests(unittest.TestCase):
+    def test_x_posts_retry_with_bounded_prompt_after_timeout(self) -> None:
+        valid = json.dumps({"format": "thread", "reason": "背景が必要", "posts": ["最初の投稿", "続きの投稿"]})
+        with (
+            patch.object(app, "ask_codex", side_effect=[app.CodexRunError("timeout", "time"), valid]) as mocked,
+            patch.object(app, "user_context", return_value="土台" * 2000),
+            patch.object(app, "record_local_error"),
+        ):
+            result = app.make_x_posts("材料" * 7000)
+        self.assertEqual(result["format"], "thread")
+        self.assertEqual(mocked.call_count, 2)
+        self.assertLess(len(mocked.call_args_list[1].args[0]), len(mocked.call_args_list[0].args[0]))
+        self.assertEqual(mocked.call_args_list[0].kwargs["timeout"], app.X_POST_PRIMARY_TIMEOUT)
+        self.assertEqual(mocked.call_args_list[1].kwargs["timeout"], app.X_POST_RETRY_TIMEOUT)
+        self.assertEqual(mocked.call_args_list[0].kwargs["reasoning_effort"], "low")
+
+    def test_x_posts_reject_more_than_three_posts(self) -> None:
+        invalid = json.dumps({"format": "thread", "reason": "多すぎる", "posts": ["1", "2", "3", "4"]})
+        with (
+            patch.object(app, "ask_codex", side_effect=[invalid, invalid]),
+            patch.object(app, "user_context", return_value=""),
+            patch.object(app, "record_local_error"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "形を読み取れません"):
+                app.make_x_posts("材料")
+
+    def test_long_material_retries_single_as_a_thread(self) -> None:
+        single = json.dumps({"format": "single", "reason": "短くまとめた", "posts": ["1本に圧縮"]})
+        thread = json.dumps({"format": "thread", "reason": "試行と変化を残す", "posts": ["試したこと", "考えが変わったこと"]})
+        with (
+            patch.object(app, "ask_codex", side_effect=[single, thread]) as mocked,
+            patch.object(app, "user_context", return_value=""),
+            patch.object(app, "record_local_error"),
+        ):
+            result = app.make_x_posts("長い記事の材料。" * 100)
+        self.assertEqual(result["format"], "thread")
+        self.assertEqual(len(result["posts"]), 2)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertIn("必ずthread", mocked.call_args_list[0].args[0])
+        self.assertIn("必ずthread", mocked.call_args_list[1].args[0])
+        self.assertIn("記事やnoteは背景資料", mocked.call_args_list[0].args[0])
+        self.assertIn("具体的な場面、つまずき、試したこと", mocked.call_args_list[0].args[0])
+
+    def test_short_self_contained_material_can_stay_single(self) -> None:
+        single = json.dumps({"format": "single", "reason": "自己完結", "posts": ["短い結論"]})
+        with (
+            patch.object(app, "ask_codex", return_value=single),
+            patch.object(app, "user_context", return_value=""),
+        ):
+            result = app.make_x_posts("短い自己完結した材料です。")
+        self.assertEqual(result["format"], "single")
+
+    def test_x_prompt_contains_approved_writing_foundation(self) -> None:
+        valid = json.dumps({"format": "single", "reason": "短い事実", "posts": ["具体的な出来事から書く"]})
+        with patch.object(app, "ask_codex", return_value=valid) as mocked, patch.object(app, "user_context", return_value=""):
+            app.make_x_posts("今日、実際に試した操作で一つだけ結果が変わった。")
+        prompt = mocked.call_args.args[0]
+        for phrase in ("具体的な出来事、数字、会話、試した操作", "実際の事実・行動 → 迷い・不確かさ", "記事やnoteは背景資料", "元記事の言い回し"):
+            self.assertIn(phrase, prompt)
+
+    def test_source_centered_and_generic_closing_phrases_trigger_retry(self) -> None:
+        banned = json.dumps({"format": "thread", "reason": "まとめ", "posts": ["保存した記事に、という話があった。", "これが参考になれば幸いです。"]})
+        valid = json.dumps({"format": "thread", "reason": "次に試す", "posts": ["実際に試したこと", "次にもう一度試すこと"]})
+        with (
+            patch.object(app, "ask_codex", side_effect=[banned, valid]) as mocked,
+            patch.object(app, "user_context", return_value=""),
+            patch.object(app, "record_local_error"),
+        ):
+            result = app.make_x_posts("記事材料をそのまま要約せず、手元の作業で試したことを考える。" * 20)
+        self.assertEqual(result["posts"], ["実際に試したこと", "次にもう一度試すこと"])
+        self.assertEqual(mocked.call_count, 2)
+
+
+class TodayNoteTests(unittest.TestCase):
+    def test_today_note_accepts_target_length_and_reaction(self) -> None:
+        text = "今日、初めて触る画面で設定を一つ変えた。説明を読んでもすぐには意味が分からず、何度か戻ってやり直した。小さな操作でも、前に進んだ感覚が残った。うまくできたというより、分からないまま止まらずに試せたことが大きい。明日は同じ手順をもう一度やって、どこで迷ったのかを短くメモしておきたい。まだ手順を人に説明できるほどではないが、昨日より一つだけ分かる場所が増えた。明日も同じ画面を開くつもりだ。"
+        text += "その感覚を忘れないようにしたい。"
+        text += "補足。" * 38
+        with patch.object(app, "ask_codex", return_value=json.dumps({"text": text}, ensure_ascii=False)):
+            result = app.make_today_note("今日見つけた画面で、設定を一つ変えて何度かやり直した。前より少しだけ仕組みが見えた", "何度かやり直したことが自分に残った。明日もう一度試したい")
+        self.assertTrue(300 <= len(result) <= 400)
+        self.assertIn("残った", result)
+
+    def test_today_note_rejects_source_summary_without_reaction(self) -> None:
+        text = "保存した記事に、仕事は終わらず通過点だという話があった。記事では目標と現在地の差を説明し、通常の努力と特別な努力を分けて考えていた。さらに、目標が高い場合は働き方を変える必要があると説明していた。これは記事の内容をまとめただけで、自分が何を思ったかは書いていない。これが参考になれば幸いです。明日は別のことを考える。内容を何度も説明しているが、本人の反応はまだ書かれていない。"
+        text += "補足。" * 38
+        with patch.object(app, "ask_codex", return_value=json.dumps({"text": text}, ensure_ascii=False)):
+            with self.assertRaisesRegex(RuntimeError, "出典中心"):
+                app.make_today_note("記事のURLと、記事に書かれていた目標と現在地の説明を見た。仕事の進め方についての長い文章だった。気になった。")
+
+    def test_today_note_retries_short_model_output(self) -> None:
+        short = json.dumps({"text": "短い反応だけです。"}, ensure_ascii=False)
+        valid = ("今日見つけた具体的な一文が残った。" * 18 + "自分は少し考え直し、明日もう一度本文を読んでみたいと思った。")[:300]
+        with patch.object(app, "ask_codex", side_effect=[short, json.dumps({"text": valid}, ensure_ascii=False)]) as mocked:
+            result = app.make_today_note("今日見つけた文章と、自分が気になった具体的な箇所。画面に残った言葉をもう一度読み返した", "自分の反応を少し具体的に書いた。明日も考えたいし、なぜ残ったのかをもう少し考えたい")
+        self.assertTrue(300 <= len(result) <= 400)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertIn("短すぎました", mocked.call_args_list[1].args[0])
+
+    def test_today_note_prompt_requires_encounter_and_reaction_without_history(self) -> None:
+        text = ("今日、実際に見つけた一文が妙に残った。" * 20 + "自分は少し引っかかり、明日もう一度考えてみたい。")[:300]
+        with patch.object(app, "ask_codex", return_value=json.dumps({"text": text}, ensure_ascii=False)) as mocked:
+            app.make_today_note("今日見つけたURLと、そのページに書かれていた具体的な一文を読んだ。短い文章だが気になった", "自分の反応を少し具体的に書いた。あとで考え直したい")
+        prompt = mocked.call_args.args[0]
+        for expected in ("Substack Notes", "300〜400文字", "出会ったもの", "本人が考えたこと・感じたこと", "過去の保存記事"):
+            self.assertIn(expected, prompt)
+
+    def test_today_note_rejects_url_with_thin_reaction(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "20文字以上"):
+            app.make_today_note("https://x.com/minowanowa/status/2089590383873560837", "気になる本とタイトル")
+
+    def test_today_note_prompt_rejects_invented_personal_profile(self) -> None:
+        text = ("今日見つけた一文が残った。自分は少し考え直した。" * 25)[:300]
+        with patch.object(app, "ask_codex", return_value=json.dumps({"text": text}, ensure_ascii=False)) as mocked:
+            app.make_today_note("今日のタイトルと本文を読んで、具体的な一文を見つけた。内容の一部が気になった", "自分の反応を具体的に書いた。少し考え直した")
+        prompt = mocked.call_args.args[0]
+        for expected in ("タイトルや人の説明は一文まで", "人物評、経歴、成功物語", "根拠のない決意や未来予測"):
+            self.assertIn(expected, prompt)
+
+    def test_today_note_pages_are_copy_ready(self) -> None:
+        self.assertIn("今日のこれ", app.today_note_page().decode())
+        self.assertIn("自動公開はしていません", app.today_note_result_page("自分の反応" * 60).decode())
+        self.assertIn("today-note-generate", app.today_note_page().decode())
+        self.assertIn("今日のこれを作っています", app.today_note_page().decode())
+
+
 class ThemeSuggestionTests(unittest.TestCase):
     def run_suggestion(self, output: str) -> list[dict[str, object]]:
         with (
@@ -508,6 +634,31 @@ class DraftGenerationTests(unittest.TestCase):
         self.assertEqual(kwargs["reasoning_effort"], "low")
         self.assertGreater(app.DRAFT_PRIMARY_TIMEOUT, 150)
 
+    def test_draft_prompt_contains_approved_prose_foundation_and_bans_source_opening(self) -> None:
+        prompt = app.build_draft_prompt(
+            self.draft_theme(),
+            [sample_item(article="今回、実際に試した操作とつまずき")],
+            "方向性",
+            "本人メモ",
+            "約2,000字",
+            "本人の土台",
+        )
+        for expected in (
+            "具体的な出来事、試したこと、つまずき、数字、観察、または問い",
+            "実際の事実・行動 → 迷い・不確かさ",
+            "本人の出来事、考えの動き、見方が変わった点",
+            "「記事を読んだ」「保存した記事に」「記事に書いてあった」などで始めない",
+            "一般的な締めを避け",
+            "外部の書き手の言い回し・見出し",
+        ):
+            self.assertIn(expected, prompt)
+
+    def test_draft_prompt_does_not_use_generic_identity_as_opening_instruction(self) -> None:
+        prompt = app.build_draft_prompt(
+            self.draft_theme(), [sample_item()], "方向性", "本人メモ", "約2,000字", "本人の土台"
+        )
+        self.assertNotIn("冒頭はパソコンとAIを触り始めた", prompt)
+
     def test_timeout_retries_once_with_preserved_material(self) -> None:
         with (
             patch.object(
@@ -613,11 +764,36 @@ class ThumbnailPreparationTests(unittest.TestCase):
 
     def test_unregistered_page_explains_one_time_setup_and_disables_generation(self) -> None:
         result = app.thumbnail_prepare_page().decode()
-        self.assertIn("Claudeで添削した完成記事", result)
+        self.assertIn("決まったタイトル", result)
+        self.assertIn("Claude Codeで添削した完成記事", result)
         self.assertIn("最初の1回だけ", result)
         self.assertIn("disabled", result)
         with self.assertRaisesRegex(ValueError, "基本プロンプト"):
-            app.make_thumbnail_instruction("完成記事", "", {}, None)
+            app.make_thumbnail_instruction("決定タイトル", "完成記事", "", {}, None)
+
+    def test_new_thumbnail_flow_is_blank_even_when_previous_article_was_saved(self) -> None:
+        app.save_setting("thumbnail_latest_title", "前の記事のタイトル")
+        app.save_setting("thumbnail_latest_article", "前の記事の完成文")
+        fresh_page = HandlerHarness("GET", "/thumbnail").body
+        self.assertIn("name='final_title'", fresh_page)
+        self.assertIn("name='final_article'", fresh_page)
+        self.assertNotIn("前の記事のタイトル", fresh_page)
+        self.assertNotIn("前の記事の完成文", fresh_page)
+        self.assertLess(fresh_page.index("決まったタイトル"), fresh_page.index("Claude Codeで添削した完成記事"))
+
+        retry_page = HandlerHarness("GET", "/thumbnail?retry=1").body
+        self.assertIn("前の記事のタイトル", retry_page)
+        self.assertIn("前の記事の完成文", retry_page)
+
+    def test_error_page_can_keep_only_the_current_title_and_article(self) -> None:
+        page = app.thumbnail_prepare_page(
+            "もう一度試してください。",
+            "今回の決定タイトル",
+            "今回の完成記事",
+        ).decode()
+        self.assertIn("今回の決定タイトル", page)
+        self.assertIn("今回の完成記事", page)
+        self.assertNotIn("前の記事", page)
 
     def test_two_reference_images_and_prompt_are_persistent_and_automatic(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + b"image-data"
@@ -646,12 +822,23 @@ class ThumbnailPreparationTests(unittest.TestCase):
             set(),
         )
         with patch.object(app, "ask_codex", return_value="完成した画像指示文") as mocked:
-            result = app.make_thumbnail_instruction("Claude完成記事", "基本プロンプト", references)
+            result = app.make_thumbnail_instruction("決定したタイトル", "Claude Code完成記事", "基本プロンプト", references)
         self.assertEqual(result, "完成した画像指示文")
         _, kwargs = mocked.call_args
         self.assertEqual(len(kwargs["images"]), 2)
         self.assertTrue(kwargs["ignore_user_config"])
-        self.assertIn("画像そのものは生成せず", mocked.call_args.args[0])
+        prompt = mocked.call_args.args[0]
+        self.assertIn("画像そのものは生成せず", prompt)
+        self.assertIn("【決まったタイトル】\n決定したタイトル", prompt)
+        self.assertIn("【Claude Codeで添削した完成記事】\nClaude Code完成記事", prompt)
+        self.assertIn("別のタイトルを作らない", prompt)
+
+    def test_title_and_article_are_both_required(self) -> None:
+        references = {"style": {"stored_name": "style.png"}, "layout": {"stored_name": "layout.png"}}
+        with self.assertRaisesRegex(ValueError, "決まったタイトル"):
+            app.make_thumbnail_instruction("", "完成記事", "基本プロンプト", references)
+        with self.assertRaisesRegex(ValueError, "Claude Code"):
+            app.make_thumbnail_instruction("決定タイトル", "", "基本プロンプト", references)
 
     def test_generation_always_passes_two_registered_images_and_optional_third(self) -> None:
         png = b"\x89PNG\r\n\x1a\n" + (b"image-data" * 20)
@@ -716,6 +903,7 @@ class ThumbnailPreparationTests(unittest.TestCase):
         self.assertIn("画像をダウンロード", page)
         self.assertIn("このMacのPersonal Flowにも保存済み", page)
         self.assertNotIn("画像指示文", page)
+        self.assertIn("/thumbnail?retry=1", page)
 
     def test_generated_image_path_rejects_unrelated_paths(self) -> None:
         self.assertIsNone(app.generated_thumbnail_path("../../personal-flow.db"))

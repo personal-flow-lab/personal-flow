@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "personal-flow.db"
 THEME_SCHEMA = ROOT / "theme_suggestion_schema.json"
 X_POST_SCHEMA = ROOT / "x_post_schema.json"
+TODAY_NOTE_SCHEMA = ROOT / "today_note_schema.json"
 DIAGNOSTIC_LOG_PATH = ROOT / "personal-flow-diagnostics.log"
 CODEX_PATH = os.environ.get("PERSONAL_FLOW_CODEX", str(Path.home() / ".local/bin/codex"))
 THEME_MODEL = os.environ.get("PERSONAL_FLOW_THEME_MODEL", "gpt-5.4-mini")
@@ -32,6 +33,11 @@ THEME_RETRY_MODEL = os.environ.get("PERSONAL_FLOW_THEME_RETRY_MODEL", "gpt-5.6-s
 THEME_REASONING_EFFORT = os.environ.get("PERSONAL_FLOW_THEME_REASONING", "low")
 THEME_PRIMARY_TIMEOUT = 75
 THEME_RETRY_TIMEOUT = 90
+X_POST_MODEL = os.environ.get("PERSONAL_FLOW_X_POST_MODEL", "gpt-5.4-mini")
+X_POST_RETRY_MODEL = os.environ.get("PERSONAL_FLOW_X_POST_RETRY_MODEL", "gpt-5.4-mini")
+X_POST_REASONING_EFFORT = os.environ.get("PERSONAL_FLOW_X_POST_REASONING", "low")
+X_POST_PRIMARY_TIMEOUT = 100
+X_POST_RETRY_TIMEOUT = 80
 DIRECTION_PRIMARY_TIMEOUT = 75
 DIRECTION_RETRY_TIMEOUT = 90
 DRAFT_MODEL = os.environ.get("PERSONAL_FLOW_DRAFT_MODEL", "gpt-5.6-sol")
@@ -52,6 +58,18 @@ X_POST_STYLE = """- 元パン屋で、異業種からパソコンとAIを触り�
 - 専門家ぶった断定、煽り、過剰な成果アピールをしない。
 - 材料にない経験、数字、成果、感情を足さない。
 - 読む人に命令せず、自分が考えたこと・次に試したいことへ自然に戻す。"""
+
+X_POST_BANNED_PHRASES = (
+    "記事を読んだ",
+    "保存した記事に",
+    "保存記事に",
+    "記事に書いてあった",
+    "記事が言っていた",
+    "という話があった",
+    "パソコンとAIを触り始めた",
+    "これが参考になれば幸いです",
+    "お役に立てれば幸いです",
+)
 
 
 class CodexRunError(RuntimeError):
@@ -740,6 +758,12 @@ def draft_rules_digest() -> str:
 - 本人の事実・本人の意見・推測・保存記事の事例を混ぜない。
 - 自分が見たこと、試したこと、現場で迷ったことを記事の中心にする。
 - 本人の自然な話し方と、考えている途中の感じを整えすぎない。
+- 書き出しは、今回の具体的な出来事、試したこと、つまずき、数字、観察、または問いから始める。一般的な自己紹介や状況説明から始めない。
+- 基本の流れは「実際の事実・行動 → 迷い・不確かさ → 自分の言葉に言い換えた補助線 → 現在の理解・次に試すこと」。材料にない要素は無理に足さない。
+- 本人の出来事、考えの動き、見方が変わった点を記事の主役にする。調査、保存記事、他人の文章は根拠や背景であり、記事の主題にしない。
+- 「記事を読んだ」「保存した記事に」「記事に書いてあった」などで始めない。特定記事の紹介やリンクが目的のときだけ、その記事に触れる。
+- 「これが参考になれば幸いです」「お役に立てれば幸いです」のような一般的な締めを避け、材料に根拠があれば未解決の点、現在の進み具合、次の行動で終える。
+- 普通の日本語で文の長さに変化をつけ、外部の書き手の言い回し・見出し・特徴的な文体をまねない。
 - 専門用語は普通の言葉で説明し、抽象論だけにしない。
 - 参考記事の表現、文体、構成をコピーしない。記事名も勝手に本文へ出さない。
 - 社会論、人生論、成功物語へ勝手に広げず、自分の場合へ戻す。
@@ -1051,35 +1075,86 @@ def refine_note_direction(theme: dict[str, object], items: list[sqlite3.Row], us
 
 def make_x_posts(material: str, images: list[Path] | None = None) -> dict[str, object]:
     """Create copy-ready X post text locally, using the signed-in Codex account only."""
-    prompt = f"""あなたは、本人が自分でXへ貼り付ける投稿文を整える編集パートナーです。
+    # Long article/note material normally contains a process, uncertainty, or change of mind.
+    # Keep a single post as an exception for genuinely short, self-contained material.
+    requires_thread = len(material.strip()) >= 700
+
+    def build_prompt(source_material: str, context_text: str, compact: bool = False, force_thread: bool = False) -> str:
+        retry_note = "今回は短くした材料だけで、すぐに完成させてください。ツールや外部情報は使わないでください。\n" if compact else ""
+        format_rule = (
+            "この材料は長めなので、singleは禁止です。必ずthreadを選び、2〜3本に分けてください。本人の迷い、実際に試したこと、考えが変わった点を残してください。\n"
+            if force_thread
+            else "長めの記事・note素材では、singleに圧縮せず、原則threadを選んで2〜3本に分けてください。本人の迷い、実際に試したこと、考えが変わった点を残してください。singleは短く自己完結した材料だけに限ります。\n"
+        )
+        return f"""あなたは、本人が自分でXへ貼り付ける投稿文を整える編集パートナーです。
 Xへの投稿、ログイン、予約、外部API接続は一切しません。
+{retry_note}
 
 【本人らしさの基準】
 {X_POST_STYLE}
 
 【Personal Flowの土台】
-{user_context() or 'まだ土台はありません。今回の材料だけを根拠にする。'}
+{context_text or 'まだ土台はありません。今回の材料だけを根拠にする。'}
 
 【今回の材料】
-{material}
+{source_material}
 
 画像が添付されている場合は、画像内の文章・見出しを今回の材料として読んでよい。ただし、見えない内容を補わない。
 
 次のルールで、X投稿案を返す。
-- 内容が一つなら single、背景を省くと本人らしさが消える時だけ thread を選ぶ。
+{format_rule}
 - single は1本、thread は2〜3本。各投稿は280字以内。
+- 書き出しは、今回の具体的な出来事、数字、会話、試した操作、またはつまずきから始める。「パソコンとAIを触り始めた」のような一般的な自己紹介から始めない。
+- 基本の流れは「実際の事実・行動 → 迷い・不確かさ → 自分の言葉に言い換えた補助線（データ・誰かの考え・たとえ） → 現在地・次に試すこと」。材料にない要素は無理に足さない。
+- 記事やnoteは背景資料であり、投稿の主役にしない。「記事を読んだ」「記事に書いてあった」から始めない。
+- 本人の具体的な場面、つまずき、試したこと、考えの変化を直接書く。記事の紹介・おすすめ・リンクをユーザーが明示した場合だけ、記事に触れてよい。
+- 「それが書いてあった」で終わらせず、材料に根拠があれば未解決の点、現在の進み具合、次に試す行動で終える。
+- 元記事の言い回し、見出し、特徴的な文体はまねず、短く会話に近い日本語にする。
 - 本文に投稿番号、見出し、絵文字、ハッシュタグ、URLは入れない。
 - 最初の投稿だけでも、何の話かと本人の結論が分かるようにする。
 - 材料が薄い時は、無理に立派な投稿にせず、分かる範囲だけで短く書く。
 - JSONだけを返す。"""
-    try:
-        result = json.loads(ask_codex(prompt, timeout=180, schema=X_POST_SCHEMA, images=images))
-        posts = result.get("posts", [])
-        if not isinstance(posts, list) or not posts or any(len(str(post)) > 280 for post in posts):
-            raise ValueError
-        return result
-    except (json.JSONDecodeError, ValueError, AttributeError) as error:
-        raise RuntimeError("X投稿文の形を読み取れませんでした。もう一度押してください。") from error
+    full_context = (user_context() or "")[:1200]
+    full_material = material[:12000]
+    compact_material = material[:5500]
+    attempts = [
+        (build_prompt(full_material, full_context, force_thread=requires_thread), X_POST_PRIMARY_TIMEOUT, X_POST_MODEL),
+        (build_prompt(compact_material, full_context[:500], compact=True, force_thread=requires_thread), X_POST_RETRY_TIMEOUT, X_POST_RETRY_MODEL),
+    ]
+    last_error: Exception | None = None
+    for attempt_index, (prompt, timeout, model) in enumerate(attempts):
+        try:
+            raw = ask_codex(
+                prompt,
+                timeout=timeout,
+                schema=X_POST_SCHEMA,
+                images=images,
+                model=model,
+                reasoning_effort=X_POST_REASONING_EFFORT,
+            )
+            result = json.loads(raw)
+            posts = result.get("posts", [])
+            if not isinstance(posts, list) or not posts or len(posts) > 3 or any(
+                not isinstance(post, str) or not post.strip() or len(post) > 280 for post in posts
+            ):
+                raise ValueError("invalid post shape")
+            if requires_thread and (result.get("format") != "thread" or len(posts) < 2):
+                raise ValueError("long material requires a 2-3 post thread")
+            if any(phrase in post for post in posts for phrase in X_POST_BANNED_PHRASES):
+                raise ValueError("source-centered or generic closing phrase is not allowed")
+            return result
+        except (json.JSONDecodeError, ValueError, AttributeError, CodexRunError) as error:
+            last_error = error
+            if attempt_index == 0:
+                record_local_error(
+                    "x_post",
+                    "automatic_retry",
+                    f"first_error={getattr(error, 'code', type(error).__name__)} first_prompt_chars={len(prompt)} retry_prompt_chars={len(attempts[1][0])}",
+                )
+                continue
+    if isinstance(last_error, CodexRunError):
+        raise last_error
+    raise RuntimeError("X投稿文の形を読み取れませんでした。もう一度押してください。") from last_error
 
 
 def x_material_from_items(items: list[sqlite3.Row]) -> str:
@@ -1196,14 +1271,17 @@ def save_thumbnail_settings(
 
 
 def make_thumbnail_instruction(
+    final_title: str,
     final_article: str,
     base_prompt: str,
     references: dict[str, dict[str, str]],
     extra_image: Path | None = None,
 ) -> str:
     """Create only the image instruction; actual image generation stays separate."""
+    if not final_title.strip():
+        raise ValueError("決まったタイトルを貼ってください。")
     if not final_article.strip():
-        raise ValueError("Claudeで添削した完成記事を貼ってください。")
+        raise ValueError("Claude Codeで添削した完成記事を貼ってください。")
     if not base_prompt.strip():
         raise ValueError("先にサムネ設定で、Obsidianの基本プロンプトを登録してください。")
     if not all(slot in references for slot in ("style", "layout")):
@@ -1217,7 +1295,10 @@ def make_thumbnail_instruction(
 【基本プロンプト】
 {base_prompt[:10000]}
 
-【Claudeで添削した完成記事】
+【決まったタイトル】
+{final_title[:300]}
+
+【Claude Codeで添削した完成記事】
 {balanced_excerpt(final_article, 24000)}
 
 【参考画像の役割】
@@ -1226,6 +1307,7 @@ def make_thumbnail_instruction(
 {('- 画像3は、今回の記事だけの追加参考。使える要素だけを取り入れる。' if extra_image else '')}
 
 守ること:
+- 「決まったタイトル」をサムネ内の主な文字として正確に使い、別のタイトルを作らない。
 - 完成記事の中心テーマが一目で伝わる構図と、サムネ内に載せる短い日本語を具体的に指定する。
 - 基本プロンプトと参考画像の役割を優先し、完成記事にない成果・数字・肩書きを足さない。
 - 検索順位や閲覧数の向上を保証しない。
@@ -1433,19 +1515,23 @@ def thumbnail_settings_page(message: str = "") -> bytes:
     return page("いつものサムネ設定", body)
 
 
-def thumbnail_prepare_page(message: str = "") -> bytes:
+def thumbnail_prepare_page(
+    message: str = "",
+    final_title: str = "",
+    final_article: str = "",
+) -> bytes:
     references = thumbnail_references()
     base_prompt = setting_value("thumbnail_base_prompt")
-    article = setting_value("thumbnail_latest_article")
     ready = bool(base_prompt and all(slot in references for slot in ("style", "layout")))
     status = "登録済みの基本プロンプトと参考画像2枚を、毎回自動で使います。" if ready else "最初の1回だけ、基本プロンプトと参考画像2枚の登録が必要です。"
     body = f"""
-    <header><div><p class='eyebrow'>THUMBNAIL PREPARATION</p><h1>Claude完成記事からサムネ準備</h1></div><p class='sub'>Claudeで添削を終えた完成記事は、下の欄へ貼ってください。</p></header>
+    <header><div><p class='eyebrow'>THUMBNAIL PREPARATION</p><h1>Claude完成記事からサムネ準備</h1></div><p class='sub'>決まったタイトル、Claude Codeで添削を終えた完成記事の順に貼ってください。</p></header>
     {f"<p class='message'>{html.escape(message)}</p>" if message else ""}
     <section class='panel'><div class='note'><strong>{html.escape(status)}</strong><br>画像1は絵柄・色・キャラクター、画像2は文字配置・余白・レイアウトの基準です。</div>
     <div class='actions'><a class='button outline' href='/thumbnail-settings'>いつものサムネ設定を確認・変更する</a></div>
     <form method='post' action='/thumbnail-generate' enctype='multipart/form-data'>
-    <label>Claudeで添削した完成記事</label><textarea name='final_article' style='min-height:320px' placeholder='Claudeで完成したnote記事を、ここへ貼ってください。'>{html.escape(article)}</textarea>
+    <label>決まったタイトル</label><input name='final_title' placeholder='最終決定したnote記事のタイトルを貼ってください。' value='{html.escape(final_title, quote=True)}' required>
+    <label>Claude Codeで添削した完成記事</label><textarea name='final_article' style='min-height:320px' placeholder='Claude Codeで完成したnote記事を、ここへ貼ってください。' required>{html.escape(final_article)}</textarea>
     <label>3枚目の参考画像（今回だけ・任意）</label><input name='extra_image' type='file' accept='image/png,image/jpeg,image/webp'>
     <p class='hint'>通常は登録済みの2枚だけで大丈夫です。3枚目は、この回の画像作成だけに使い、保存しません。</p>
     <button class='primary' type='submit' {'disabled' if not ready else ''}>サムネ画像を作る</button>
@@ -1460,7 +1546,7 @@ def thumbnail_result_page(image_filename: str, used_extra: bool) -> bytes:
     <header><div><p class='eyebrow'>THUMBNAIL READY</p><h1>noteのサムネ画像ができました</h1></div><p class='sub'>登録済みの参考画像2枚を毎回自動で使いました。{'今回は3枚目も加えました。' if used_extra else ''}</p></header>
     <section class='panel'><img class='generated-image' src='{image_url}' alt='生成したnote記事のサムネ画像'>
     <p class='hint'>画像はこのMacのPersonal Flowにも保存済みです。内容と文字を確認してからnoteへ使ってください。</p>
-    <div class='actions'><a class='button' href='{download_url}'>画像をダウンロード</a><a class='button outline' href='/thumbnail'>同じ記事で作り直す</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
+    <div class='actions'><a class='button' href='{download_url}'>画像をダウンロード</a><a class='button outline' href='/thumbnail?retry=1'>同じ記事で作り直す</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
     return page("noteのサムネ画像", body)
 
 
@@ -1475,6 +1561,93 @@ def x_post_page(result: dict[str, object]) -> bytes:
     <header><div><p class='eyebrow'>COPY READY</p><h1>X投稿文ができました</h1></div><p class='sub'>Xへの自動投稿はしていません。コピーして、ご自身でXへ貼り付けてください。</p></header>
     <section class='panel'><div class='note'><strong>{'1投稿' if result.get('format') == 'single' else 'スレッド投稿'}</strong><br>{html.escape(str(result.get('reason', '')))}</div>{cards}<div class='actions'><a class='button outline' href='/x-post'>別の材料で作る</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>"""
     return page("X投稿文", body)
+
+
+TODAY_NOTE_BANNED_PHRASES = (
+    "保存した記事に",
+    "記事に書いてあった",
+    "記事が言っていた",
+    "これが参考になれば幸いです",
+    "お役に立てれば幸いです",
+    "未来を見て動いてきた人",
+    "決めたことを形にしていく経営者",
+    "今の動き方も変わりそう",
+)
+TODAY_NOTE_REACTION_MARKERS = ("自分", "気になった", "引っかかった", "考えた", "思った", "感じた", "迷った", "試した", "残った", "今は")
+
+
+def today_note_result_page(text: str) -> bytes:
+    return page(
+        "今日のこれ",
+        f"""
+        <header><div><p class='eyebrow'>SUBSTACK NOTES</p><h1>今日のこれ</h1></div><p class='sub'>自分の未来のために残す、短い公開メモです。Substack Notesへは自分で貼り付けてください。</p></header>
+        <section class='panel'><article class='card'><div class='summary'>{html.escape(text)}</div><button class='copy' type='button' data-copy='{html.escape(text, quote=True)}'>このメモをコピー</button></article>
+        <p class='hint'>文字数: {len(text)}文字。自動公開はしていません。</p><div class='actions'><a class='button outline' href='/today-note'>別の「今日のこれ」を作る</a><a class='button outline' href='/'>Personal Flowへ戻る</a></div></section>""",
+    )
+
+
+def today_note_page(message: str = "") -> bytes:
+    notice = f"<p class='message'>{html.escape(message)}</p>" if message else ""
+    return page(
+        "今日のこれ",
+        f"""
+        <header><div><p class='eyebrow'>SUBSTACK NOTES</p><h1>今日のこれ</h1></div><p class='sub'>今日出会って、あとからも残った一つを、自分の未来のために短くメモします。</p></header>
+        <section class='panel'>{notice}<form method='post' action='/today-note-generate'>
+        <label>今日出会ったもの（URLまたは文章）</label><textarea name='encounter' required placeholder='見つけたURL、言葉、X投稿、誰かの文章、今日起きたことなどを1つだけ。'></textarea>
+        <label>自分に残ったこと（任意）</label><textarea name='reaction' placeholder='どこが残ったか／何を考えたか／少し引っかかったこと。短くて大丈夫です。'></textarea>
+        <p class='hint'>過去の保存記事やX投稿は自動で追加しません。今日の一つだけを使います。300〜400文字で、Substack Notesに貼れる形にします。</p>
+        <button class='primary' type='submit'>「今日のこれ」を作る</button></form></section>""",
+    )
+
+
+def make_today_note(encounter: str, reaction: str = "") -> str:
+    """Create one light, copy-ready Substack Notes memo without using saved history."""
+    looks_like_url = bool(re.match(r"^https?://\S+$", encounter.strip(), re.IGNORECASE))
+    if looks_like_url and len(reaction.strip()) < 20:
+        raise RuntimeError("URLだけでは具体的なメモを作れません。どこが残ったか、20文字以上で一言足してください。")
+    if len(encounter.strip()) + len(reaction.strip()) < 50:
+        raise RuntimeError("材料が短すぎます。今日出会ったものの具体的な一点と、自分の反応をもう少し足してください。")
+    prompt = f"""あなたは、本人が自分の未来のために残すSubstack Notes用の短い公開メモを整える編集パートナーです。
+これは日記、今日の出来事の一覧、記事要約、一般論ではありません。今日出会った一つを、あとで自分が読み返せる形にします。自動公開はしません。
+過去の保存記事やX投稿は自動で追加せず、今回入力された一つだけを使います。
+
+【今日出会ったもの】
+{encounter[:5000]}
+
+【本人に残ったこと】
+{reaction[:1200] or 'まだ短い反応はありません。材料から無理に感情や体験を作らず、出会ったもののどこが残りそうかを控えめに言葉にする。'}
+
+【必ず守ること】
+- 必ず300〜400文字。400文字を超えず、300文字未満の短文は返さない。
+- 「出会ったもの」→「具体的に残った点」→「本人が考えたこと・感じたこと」の順で、反応を必ず入れる。単なる要約にしない。
+- 普通で力まない日本語。深い自己開示、決まり文句の自己紹介、抽象的な人生訓、一般的な締めは不要。
+- 出会ったタイトルや人の説明は一文まで。タイトルをそのまま長く冒頭に置かず、人物評、経歴、成功物語、一般論、根拠のない決意や未来予測を足さない。
+- 入力にない「若い頃から〜」「〜な人」「経営者」「今後は変わりそう」などの人物像や変化を推測しない。URLの本文を読めても、書かれている事実と本人の反応だけを使う。
+- 「保存した記事に」「記事に書いてあった」「記事が言っていた」など、出典を主役にする書き出しは禁止。特定の出典を紹介・リンクする依頼ではないので、出会った内容と本人の反応を中心にする。
+- 「これが参考になれば幸いです」「お役に立てれば幸いです」で終えない。
+- 外部の書き手の言い回し、見出し、特徴的な文体をまねない。
+- JSONだけを返し、前置きやMarkdownは付けない。"""
+    last_error: RuntimeError | None = None
+    for attempt in range(2):
+        retry_note = "前回の案は短すぎました。300〜400文字になるまで、具体的に残った一点と本人の反応だけを自然に厚くしてください。一般論や水増しは禁止です。\n" if attempt else ""
+        attempt_prompt = retry_note + prompt
+        raw = ask_codex(attempt_prompt, timeout=90, schema=TODAY_NOTE_SCHEMA, model=X_POST_MODEL, reasoning_effort="low")
+        try:
+            text = json.loads(raw).get("text", "").strip()
+        except (json.JSONDecodeError, AttributeError) as error:
+            last_error = RuntimeError("今日のこれの形を読み取れませんでした。もう一度試してください。")
+            if attempt == 0:
+                continue
+            raise last_error from error
+        if not 300 <= len(text) <= 400:
+            last_error = RuntimeError("今日のこれが300〜400文字に収まりませんでした。もう一度試してください。")
+            continue
+        if any(phrase in text for phrase in TODAY_NOTE_BANNED_PHRASES):
+            raise RuntimeError("出典中心の表現が入っていたため、安全に表示できませんでした。もう一度試してください。")
+        if not any(marker in text for marker in TODAY_NOTE_REACTION_MARKERS):
+            raise RuntimeError("本人の反応が入っていないため、安全に表示できませんでした。もう一度試してください。")
+        return text
+    raise last_error or RuntimeError("今日のこれを作れませんでした。もう一度試してください。")
 
 
 def draft_result_page(result: str) -> bytes:
@@ -1631,11 +1804,11 @@ button,.button{{display:inline-flex;align-items:center;justify-content:center;bo
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}} .generated-image{{display:block;width:100%;height:auto;border-radius:12px;border:1px solid var(--line);background:#fff}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid,.entry-grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
-document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate'], form[action='/thumbnail-generate']").forEach((form) => {{
+document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate'], form[action='/today-note-generate'], form[action='/thumbnail-generate']").forEach((form) => {{
   form.addEventListener("submit", () => {{
     const button = form.querySelector("button");
     button.disabled = true;
-    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : form.action.endsWith("/thumbnail-generate") ? "Youがサムネ画像を作っています…（数分かかることがあります）" : "Youがテーマを考えています…";
+    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : form.action.endsWith("/today-note-generate") ? "今日のこれを作っています…" : form.action.endsWith("/thumbnail-generate") ? "Youがサムネ画像を作っています…（数分かかることがあります）" : "Youがテーマを考えています…";
   }});
 }});
 document.querySelectorAll("[data-copy]").forEach((button) => {{
@@ -1701,7 +1874,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             self.send_thumbnail_file(image_path, query.get("download", [""])[0] == "1")
             return
-        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize", "/thumbnail", "/thumbnail-settings"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize", "/thumbnail", "/thumbnail-settings", "/today-note"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         flow = active_flow()
@@ -1710,7 +1883,13 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             self.send_html(thumbnail_settings_page())
             return
         if route.path == "/thumbnail":
-            self.send_html(thumbnail_prepare_page())
+            retry_same_article = query.get("retry", [""])[0] == "1"
+            self.send_html(
+                thumbnail_prepare_page(
+                    final_title=setting_value("thumbnail_latest_title") if retry_same_article else "",
+                    final_article=setting_value("thumbnail_latest_article") if retry_same_article else "",
+                )
+            )
             return
         if route.path == "/organize":
             self.send_html(organize_items_page(items))
@@ -1742,6 +1921,9 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             <label>画像（任意・複数可）</label><input name='images' type='file' accept='image/png,image/jpeg,image/webp' multiple><p class='hint'>画像に書かれた文章も材料にできます。画像は投稿文作成のためだけに使い、保存しません。</p>
             <button class='primary' type='submit'>この材料からX投稿文をつくる</button></form></section>"""
             self.send_html(page("X投稿をつくる", body))
+            return
+        if route.path == "/today-note":
+            self.send_html(today_note_page())
             return
         if route.path == "/x-choose-sources":
             source_cards = "".join(
@@ -1842,7 +2024,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             ) or "<div class='empty'>まず記事を保存すると、ここに考える入口が出る。</div>"
         body = f"""
 <header><div><p class='eyebrow'>PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div><p class='sub'>流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p></header>
-<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ画像をつくる</strong><span>完成記事を貼るだけで、いつもの参考画像2枚を使って画像まで作る。</span></a></section>
+<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/today-note'><strong>今日のこれ</strong><span>今日出会って残った一つを、Substack Notes用の短いメモにする。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ画像をつくる</strong><span>完成記事を貼るだけで、いつもの参考画像2枚を使って画像まで作る。</span></a></section>
 <div class='grid'><section class='panel' id='save'><h2>情報をためる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
 <label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
@@ -1901,6 +2083,8 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         if self.path == "/thumbnail-generate":
             content_type = self.headers.get("Content-Type", "")
             extra_path: Path | None = None
+            final_title = ""
+            final_article = ""
             if not content_type.startswith("multipart/form-data"):
                 self.send_html(thumbnail_prepare_page("完成記事を読み取れませんでした。もう一度貼ってください。"), 400)
                 return
@@ -1910,8 +2094,8 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                     headers=self.headers,
                     environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
                 )
+                final_title = form.getfirst("final_title", "").strip()
                 final_article = form.getfirst("final_article", "").strip()
-                save_setting("thumbnail_latest_article", final_article)
                 extra = form["extra_image"] if "extra_image" in form else None
                 if extra is not None and getattr(extra, "filename", None):
                     data, suffix, _ = read_thumbnail_image(extra, "3枚目の参考画像")
@@ -1920,11 +2104,14 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                         extra_path = Path(output.name)
                 references = thumbnail_references()
                 instruction = make_thumbnail_instruction(
+                    final_title,
                     final_article,
                     setting_value("thumbnail_base_prompt"),
                     references,
                     extra_path,
                 )
+                save_setting("thumbnail_latest_title", final_title)
+                save_setting("thumbnail_latest_article", final_article)
                 generated = generate_thumbnail_image(
                     instruction,
                     references,
@@ -1932,13 +2119,13 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 )
                 self.send_html(thumbnail_result_page(generated.name, extra_path is not None))
             except ValueError as error:
-                self.send_html(thumbnail_prepare_page(str(error)), 400)
+                self.send_html(thumbnail_prepare_page(str(error), final_title, final_article), 400)
             except CodexRunError as error:
                 record_local_error("thumbnail_instruction", error.code, str(error))
-                self.send_html(thumbnail_prepare_page("サムネ画像を作る準備の途中で止まりました。同じ完成記事でもう一度試してください。"), 504 if error.code == "timeout" else 502)
+                self.send_html(thumbnail_prepare_page("サムネ画像を作る準備の途中で止まりました。同じ完成記事でもう一度試してください。", final_title, final_article), 504 if error.code == "timeout" else 502)
             except ThumbnailGenerationError as error:
                 self.send_html(
-                    thumbnail_prepare_page(str(error)),
+                    thumbnail_prepare_page(str(error), final_title, final_article),
                     504 if error.code == "timeout" else 502,
                 )
             finally:
@@ -1970,6 +2157,19 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             body = f"<h1>選んだ{len(deleted)}件を削除しました</h1><p class='message'>今回の記事の箱から、確認した{len(deleted)}件だけを削除しました。</p><p><a class='button' href='/'>情報の一覧へ戻る</a></p>"
             self.send_html(page("情報を削除しました", body))
+            return
+        if self.path == "/today-note-generate":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            encounter = values.get("encounter", [""])[0].strip()
+            reaction = values.get("reaction", [""])[0].strip()
+            if not encounter:
+                self.send_html(today_note_page("今日出会ったものを1つ入れてください。"), 400)
+                return
+            try:
+                self.send_html(today_note_result_page(make_today_note(encounter, reaction)))
+            except (RuntimeError, OSError) as error:
+                self.send_html(today_note_page(str(error)), 400)
             return
         if self.path == "/x-generate":
             content_type = self.headers.get("Content-Type", "")
