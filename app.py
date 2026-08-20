@@ -423,6 +423,28 @@ def make_summary(text: str) -> str:
     return "\n".join(f"・{sentence[:180]}" for sentence in picked)
 
 
+def prepare_pasted_article(text: str) -> tuple[str, str]:
+    """Validate a user-written article without fetching any external page."""
+    article = text.strip()
+    if not article:
+        raise ValueError("完成した記事の本文を貼ってください。")
+    if len(re.sub(r"\s+", "", article)) < 120:
+        raise ValueError("記事本文が短すぎます。完成した記事を、最初から最後まで貼ってください。")
+    first_line = next((line.strip() for line in article.splitlines() if line.strip()), "")
+    title = re.sub(r"^[#>＊*・\-\s]+", "", first_line).strip()
+    if not 4 <= len(title) <= 120:
+        title = "貼り付けた完成記事"
+    return title, article
+
+
+def item_source_html(item: sqlite3.Row) -> str:
+    """Show a link only for URL-based items; pasted articles have no fake URL."""
+    url = str(item["url"] or "").strip()
+    if not url:
+        return "<span class='meta'>URLなし・貼り付けた完成記事</span>"
+    return f"<a href='{html.escape(url, quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
+
+
 def themes(items: list[sqlite3.Row]) -> list[tuple[str, str]]:
     """Transparent local starters, based only on saved titles and personal notes."""
     selected = items[:5]
@@ -1749,7 +1771,7 @@ def organize_items_page(items: list[sqlite3.Row]) -> bytes:
     cards = "".join(
         f"<article class='card'><label class='pick'><input type='checkbox' name='item_ids' value='{item['id']}'>この情報を整理対象にする</label>"
         f"<div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
-        f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
+        f"{item_source_html(item)}"
         f"<div class='summary'>{html.escape(item['summary'])}</div></article>"
         for item in items
     ) or "<div class='empty'>整理する情報はありません。</div>"
@@ -1766,7 +1788,7 @@ def delete_items_confirmation_page(flow_id: int, items: list[sqlite3.Row]) -> by
     cards = "".join(
         f"<article class='card'><div class='meta'>{html.escape(item['created_at'])}</div>"
         f"<h3>{html.escape(item['title'])}</h3>"
-        f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a></article>"
+        f"{item_source_html(item)}</article>"
         for item in items
     )
     count = len(items)
@@ -1797,7 +1819,7 @@ def page(title: str, body: str) -> bytes:
 *{{box-sizing:border-box}} body{{margin:0;background:var(--paper);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,'Hiragino Sans',sans-serif;line-height:1.55}}
 main{{max-width:1180px;margin:0 auto;padding:46px 24px 72px}} header{{display:flex;justify-content:space-between;gap:28px;align-items:end;border-bottom:1px solid var(--line);padding-bottom:24px;margin-bottom:24px}}
 h1{{font-size:42px;letter-spacing:-.05em;margin:0}} h2{{font-size:18px;margin:0 0 14px}} h3{{font-size:16px;margin:0 0 7px}} .eyebrow{{color:var(--green);font-weight:800;font-size:12px;letter-spacing:.08em;margin:0 0 6px}} .sub{{color:var(--muted);max-width:460px;margin:0;font-size:14px}}
-.grid{{display:grid;grid-template-columns:minmax(310px,.9fr) minmax(390px,1.25fr);gap:20px;align-items:start}} .panel,.card{{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 8px 22px #25251a09}} .panel{{padding:22px}} .card{{padding:18px;margin-top:12px}}
+.grid{{display:grid;grid-template-columns:minmax(310px,.9fr) minmax(390px,1.25fr);gap:20px;align-items:start}} .stack{{display:grid;gap:20px}} .panel,.card{{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 8px 22px #25251a09}} .panel{{padding:22px}} .card{{padding:18px;margin-top:12px}}
 label{{display:block;font-weight:750;font-size:13px;margin-top:15px}} input,textarea{{width:100%;font:inherit;border:1px solid #cac7bd;border-radius:9px;padding:12px;background:#fff;margin-top:6px}} textarea{{min-height:100px;resize:vertical}}
 button,.button{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;padding:12px 15px;background:var(--ink);color:#fff;font-weight:750;font:inherit;text-decoration:none;cursor:pointer}} button:disabled{{opacity:.45;cursor:not-allowed}} button.primary{{background:var(--green);width:100%;margin-top:18px}} button.danger{{background:#a3342e}} .danger-outline{{background:transparent;color:#8c2f2a;border:1px solid #cda5a1}} .hint{{font-size:12px;color:var(--muted);margin:9px 0 0}}
 .section-head{{display:flex;justify-content:space-between;align-items:center;gap:12px}} .count{{font-size:12px;color:var(--muted);background:#edebe5;border-radius:99px;padding:3px 8px}} .meta{{font-size:12px;color:var(--muted)}} .summary{{white-space:pre-wrap;font-size:14px;margin:12px 0}} .note{{background:#f2f5ef;border-radius:8px;padding:10px 12px;font-size:13px}} a{{color:var(--green)}} .empty{{color:var(--muted);padding:24px 0;text-align:center}}
@@ -1943,7 +1965,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             source_cards = "".join(
                 f"<article class='card'><label class='pick'><input type='checkbox' name='item_ids' value='{item['id']}'>この情報をテーマに使う</label>"
                 f"<div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
-                f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
+                f"{item_source_html(item)}"
                 f"<div class='summary'>{html.escape(item['summary'])}</div></article>"
                 for item in items
             ) or "<div class='empty'>まず情報を保存してください。</div>"
@@ -2009,7 +2031,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             return
         cards = "".join(
             f"<article class='card'><div class='meta'>{html.escape(item['created_at'])}</div><h3>{html.escape(item['title'])}</h3>"
-            f"<a href='{html.escape(item['url'], quote=True)}' target='_blank' rel='noreferrer'>原文を開く ↗</a>"
+            f"{item_source_html(item)}"
             f"<div class='summary'>{html.escape(item['summary'])}</div>"
             f"<div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div>"
             f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form></div></article>"
@@ -2025,9 +2047,13 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
         body = f"""
 <header><div><p class='eyebrow'>PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div><p class='sub'>流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p></header>
 <section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/today-note'><strong>今日のこれ</strong><span>今日出会って残った一つを、Substack Notes用の短いメモにする。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ画像をつくる</strong><span>完成記事を貼るだけで、いつもの参考画像2枚を使って画像まで作る。</span></a></section>
-<div class='grid'><section class='panel' id='save'><h2>情報をためる</h2><p class='hint'>URLを貼るだけ。データはこのMacの中に保存される。</p>
+{("<p class='message'>完成した記事を保存しました。URLを使わず、貼り付けた本文だけから要点を表示しています。</p>" if query.get("saved", [""])[0] == "pasted" else "")}
+<div class='grid'><div class='stack'><section class='panel' id='save'><h2>URLから情報をためる</h2><p class='hint'>記事や動画のURLと、自分の一言メモを残します。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
-<label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>保存して要点を見る</button></form></section>
+<label>ひとことメモ（任意）</label><textarea name='note' placeholder='なぜ気になったか／何に使えそうか'></textarea><button class='primary' type='submit'>URLから保存して要点を見る</button></form></section>
+<section class='panel'><h2>完成した記事から始める</h2><p class='hint'>自分で書き上げた記事本文を貼ります。URLや外部ページは読み込みません。</p>
+<form method='post' action='/save-pasted-article'><label>完成した記事を貼り付ける</label><textarea name='article' style='min-height:280px' placeholder='完成した記事を、タイトルから本文の最後まで貼ってください。' required></textarea>
+<button class='primary' type='submit'>完成記事を保存して要点を見る</button></form></section></div>
 <section class='panel'><div class='section-head'><h2>今回の記事の情報</h2><span class='count'>{len(items)} 件</span></div><div class='actions'><a class='button' href='/choose-sources'>テーマに使う情報を選ぶ</a><a class='button outline' href='/organize'>不要な情報を整理する</a><a class='button outline' href='/finish'>今回の記事を終える</a><a class='button outline' href='/context'>自分の土台を見直す</a><a class='button outline' href='/themes'>仮の入口を見る</a></div><p class='hint'>テーマに使う記事を選んでから、Youにテーマ案を頼めます。</p>{theme_cards}{cards}</section></div>"""
         self.send_html(page("情報受け箱", body))
 
@@ -2363,6 +2389,24 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 record_local_error("note_draft", "unexpected_error", f"{type(error).__name__}: {error}")
                 body = f"<h1>下書きを作れませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a href='/article-form?run_id={run['id']}&theme={values.get('theme', [''])[0]}'>記事にする前のメモへ戻る</a></p>"
                 self.send_html(page("下書きを作れませんでした", body), 400)
+            return
+        if self.path == "/save-pasted-article":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            try:
+                title, article = prepare_pasted_article(values.get("article", [""])[0])
+                flow = active_flow()
+                with database() as connection:
+                    connection.execute(
+                        "INSERT INTO items(url, title, article, summary, note, created_at, flow_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        ("", title, article, make_summary(article), "", datetime.now().strftime("%Y-%m-%d %H:%M"), flow["id"]),
+                    )
+                self.send_response(303)
+                self.send_header("Location", "/?saved=pasted")
+                self.end_headers()
+            except ValueError as error:
+                body = f"<h1>完成記事を保存できませんでした</h1><p class='message'>{html.escape(str(error))}</p><p><a class='button' href='/#save'>完成記事を貼る画面へ戻る</a></p>"
+                self.send_html(page("完成記事を保存できませんでした", body), 400)
             return
         if self.path != "/save":
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)

@@ -112,6 +112,79 @@ class HandlerHarness(app.PersonalFlowHandler):
         return self.wfile.getvalue()
 
 
+class PastedArticleSaveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(app, "DB_PATH", Path(self.temp.name) / "pasted.db")
+        self.db_patch.start()
+        app.database().close()
+
+    def tearDown(self) -> None:
+        self.db_patch.stop()
+        self.temp.cleanup()
+
+    @staticmethod
+    def completed_article() -> str:
+        return "完成した記事のタイトル\n\n" + "自分で書き上げた記事の本文です。外部ページを読まず、この文章だけを材料にします。" * 12
+
+    def test_home_clearly_separates_url_and_completed_article_entries(self) -> None:
+        page = HandlerHarness("GET", "/").body
+        self.assertIn("URLから情報をためる", page)
+        self.assertIn("完成した記事から始める", page)
+        self.assertIn("action='/save'", page)
+        self.assertIn("action='/save-pasted-article'", page)
+        self.assertIn("URLや外部ページは読み込みません", page)
+        self.assertLess(page.index("URLから情報をためる"), page.index("完成した記事から始める"))
+
+    def test_pasted_article_saves_without_fetching_and_joins_current_flow(self) -> None:
+        article = self.completed_article()
+        with patch.object(app, "extract_article") as fetch:
+            response = HandlerHarness("POST", "/save-pasted-article", [("article", article)])
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.response_headers["Location"], "/?saved=pasted")
+        fetch.assert_not_called()
+
+        items = app.flow_items(app.active_flow()["id"])
+        self.assertEqual(len(items), 1)
+        saved = items[0]
+        self.assertEqual(saved["url"], "")
+        self.assertEqual(saved["title"], "完成した記事のタイトル")
+        self.assertEqual(saved["article"], article)
+        self.assertTrue(saved["summary"])
+        self.assertEqual(saved["note"], "")
+
+        result_page = HandlerHarness("GET", response.response_headers["Location"]).body
+        self.assertIn("完成した記事を保存しました", result_page)
+        self.assertIn("完成した記事のタイトル", result_page)
+        self.assertIn("URLなし・貼り付けた完成記事", result_page)
+        self.assertNotIn("href=''", result_page)
+        next_page = HandlerHarness("GET", "/choose-sources").body
+        self.assertIn("完成した記事のタイトル", next_page)
+        self.assertIn("URLなし・貼り付けた完成記事", next_page)
+
+    def test_empty_and_short_articles_show_friendly_errors_and_save_nothing(self) -> None:
+        empty = HandlerHarness("POST", "/save-pasted-article", [("article", "")])
+        self.assertEqual(empty.status, 400)
+        self.assertIn("完成した記事の本文を貼ってください", empty.body)
+        short = HandlerHarness("POST", "/save-pasted-article", [("article", "短い本文です。")])
+        self.assertEqual(short.status, 400)
+        self.assertIn("記事本文が短すぎます", short.body)
+        self.assertEqual(len(app.flow_items(app.active_flow()["id"])), 0)
+
+    def test_existing_url_save_still_fetches_and_saves_normally(self) -> None:
+        with patch.object(app, "extract_article", return_value=("URL記事", "URLから取得した本文です。" * 10)) as fetch:
+            response = HandlerHarness(
+                "POST",
+                "/save",
+                [("url", "https://example.com/article"), ("note", "一言メモ")],
+            )
+        self.assertEqual(response.status, 303)
+        fetch.assert_called_once_with("https://example.com/article")
+        saved = app.flow_items(app.active_flow()["id"])[0]
+        self.assertEqual(saved["url"], "https://example.com/article")
+        self.assertEqual(saved["note"], "一言メモ")
+
+
 class SelectedItemsTests(unittest.TestCase):
     def test_invalid_or_missing_ids_never_fall_back_to_all_items(self) -> None:
         items = [sample_item(1), sample_item(2)]
