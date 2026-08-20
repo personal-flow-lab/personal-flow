@@ -1622,6 +1622,122 @@ def today_note_page(message: str = "") -> bytes:
     )
 
 
+def today_note_from_item_page(
+    item: sqlite3.Row,
+    message: str = "",
+    reaction: str = "",
+) -> bytes:
+    """Show a dedicated, non-generating preparation step for one saved item."""
+    notice = f"<p class='message'>{html.escape(message)}</p>" if message else ""
+    source = "URLなし・貼り付けた完成記事" if not str(item["url"] or "").strip() else "URLで保存した情報"
+    return page(
+        "保存情報から今日のこれ",
+        f"""
+        <header><div><p class='eyebrow'>SUBSTACK NOTES</p><h1>この情報から「今日のこれ」</h1></div><p class='sub'>選んだ保存情報を1つだけ材料に、Substack Notes用の短い投稿を考えます。</p></header>
+        <section class='panel'>{notice}<div class='note'><strong>今回使う情報</strong><br>{html.escape(str(item['title']))}<br><span class='meta'>{html.escape(source)}</span></div>
+        <div class='summary'>{html.escape(str(item['summary'] or '要点はまだありません。'))}</div>
+        {f"<div class='note'><strong>保存時の自分のメモ</strong><br>{html.escape(str(item['note']))}</div>" if str(item['note'] or '').strip() else ""}
+        <form method='post' action='/today-note-from-item-generate'>
+        <input type='hidden' name='item_id' value='{item['id']}'>
+        <label>今回もう少し入れたいこと（任意）</label><textarea name='reaction' placeholder='どこが残ったか／自分は何を考えたか。短くて大丈夫です。'>{html.escape(reaction)}</textarea>
+        <p class='hint'>400字前後は、読み疲れしにくくするための目安です。内容に合わせて短くなったり、少し超えたりします。文字数合わせの水増しや、材料にない体験・数字・成果の追加はしません。</p>
+        <button class='primary' type='submit'>今日のこれをつくる</button></form>
+        <p class='hint'>この画面を開いただけでは文章作成は始まりません。上のボタンを押した時だけ、選んだ情報を使います。</p>
+        <div class='actions'><a class='button outline' href='/'>保存した情報へ戻る</a></div></section>""",
+    )
+
+
+def today_note_from_item_result_page(text: str, item_id: int) -> bytes:
+    return page(
+        "今日のこれ",
+        f"""
+        <header><div><p class='eyebrow'>SUBSTACK NOTES</p><h1>今日のこれ</h1></div><p class='sub'>選んだ保存情報から作った、Substack Notes用の短い投稿です。</p></header>
+        <section class='panel'><article class='card'><div class='summary'>{html.escape(text)}</div><button class='copy' type='button' data-copy='{html.escape(text, quote=True)}'>この投稿文をコピー</button></article>
+        <p class='hint'>文字数: {len(text)}文字。400字前後は読みやすさの目安で、品質や反応を保証するものではありません。自動公開はしていません。</p>
+        <div class='actions'><a class='button outline' href='/today-note-from-item?item_id={item_id}'>同じ情報でもう一度作る</a><a class='button outline' href='/'>保存した情報へ戻る</a></div></section>""",
+    )
+
+
+def today_note_material_from_item(item: sqlite3.Row) -> tuple[str, bool]:
+    """Keep the chosen item's useful parts without including unrelated saved history."""
+    article = str(item["article"] or "").strip()
+    summary = str(item["summary"] or "").strip()
+    note = str(item["note"] or "").strip()
+    short_material = len(article) + len(summary) + len(note) < 1400
+    article_limit = 5200 if not short_material else 2600
+    material = (
+        f"タイトル: {str(item['title']).strip()}\n"
+        f"保存時の本人メモ: {note or 'なし'}\n"
+        f"要点: {balanced_excerpt(summary, 1400) or 'なし'}\n"
+        f"本文の冒頭・中盤・末尾: {balanced_excerpt(article, article_limit) or 'なし'}"
+    )
+    return material, short_material
+
+
+def make_today_note_from_item(item: sqlite3.Row, reaction: str = "") -> str:
+    """Create one Substack Notes post from exactly one chosen saved item."""
+    material, short_material = today_note_material_from_item(item)
+    context = balanced_excerpt(user_context(), 2200 if short_material else 1200)
+    prompt = f"""あなたは、本人がSubstack Notesで続けている「今日のこれ」を整える編集パートナーです。
+今回は、本人が選んだ保存情報1件だけから、返信コメントではなく、単独で読める短い公開投稿を作ります。自動公開はしません。
+
+【選んだ保存情報】
+{material}
+
+【今回、本人が足したこと】
+{reaction[:1600] or 'なし'}
+
+【本人の土台】
+{context or '未登録'}
+
+【この材料の長さ】
+{'短め。本人の土台がある場合は、書き方・関心・考え方の文脈だけを使って自然に厚みを足す。' if short_material else '長め。中心の気づきと具体例を残し、読みやすく短く整える。'}
+
+【必ず守ること】
+- 400字前後を目安にする。ただし厳密な上限・下限ではない。自然なら短くても少し長くてもよく、文字数だけのために水増ししない。
+- 選んだ保存情報、保存時の本人メモ、今回足したこと、本人の土台にある内容だけを使う。別の保存記事や外部情報を混ぜない。
+- 材料にない体験、数字、成果、肩書き、感情、決意を作らない。本人の土台は口調と既に書かれた考え方の参考に限る。
+- 長い材料は中心の気づきと具体性を残す。短い材料は一般論や同じ意味の言い換えで膨らませない。
+- AIらしい整いすぎた定型文、専門家ぶった断定、煽り、過剰な教訓、読者への命令を避ける。本人が実際に書きそうな温度と人間味を優先する。
+- 「保存した記事に」「記事に書いてあった」「これが参考になれば幸いです」「お役に立てれば幸いです」は使わない。
+- 400字前後は読み疲れしにくくするための目安であり、品質や反応を保証しない。研究や文字数の説明を投稿本文には書かない。
+- JSONだけを返し、前置きやMarkdownは付けない。
+"""
+    last_error: Exception | None = None
+    for attempt in range(2):
+        retry = ""
+        if attempt:
+            retry = "前回の案は長さか内容の形が不自然でした。中心の気づきと具体性を守り、文字数合わせの水増しをせず、400字前後へ自然に整えてください。\n"
+        try:
+            raw = ask_codex(
+                retry + prompt,
+                timeout=90 if attempt == 0 else 75,
+                schema=TODAY_NOTE_SCHEMA,
+                model=X_POST_MODEL,
+                reasoning_effort="low",
+                ignore_user_config=True,
+            )
+            text = str(json.loads(raw).get("text", "")).strip()
+            if not text:
+                raise ValueError("empty text")
+            if any(phrase in text for phrase in TODAY_NOTE_BANNED_PHRASES):
+                raise ValueError("source-centered or generic phrase")
+            if attempt == 0 and not 240 <= len(text) <= 560:
+                raise ValueError(f"length={len(text)}")
+            if not 100 <= len(text) <= 900:
+                raise ValueError(f"unusable length={len(text)}")
+            return text
+        except CodexRunError:
+            raise
+        except (json.JSONDecodeError, ValueError, AttributeError) as error:
+            last_error = error
+            if attempt == 0:
+                record_local_error("today_note_from_item", "automatic_retry", str(error))
+                continue
+    record_local_error("today_note_from_item", "invalid_output", str(last_error or "unknown"))
+    raise RuntimeError("短い投稿の形を整えられませんでした。同じ情報でもう一度試してください。") from last_error
+
+
 def make_today_note(encounter: str, reaction: str = "") -> str:
     """Create one light, copy-ready Substack Notes memo without using saved history."""
     looks_like_url = bool(re.match(r"^https?://\S+$", encounter.strip(), re.IGNORECASE))
@@ -1826,11 +1942,11 @@ button,.button{{display:inline-flex;align-items:center;justify-content:center;bo
 .actions{{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}} .outline{{background:transparent;color:var(--ink);border:1px solid var(--line)}} .theme{{border-left:4px solid var(--green)}} .theme p{{margin:4px 0 0;white-space:pre-line;color:#4f5551;font-size:14px}} .message{{padding:12px 15px;border-radius:10px;background:#fff1d7;color:#684611;margin-bottom:16px}} .pick{{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:750;color:var(--green);cursor:pointer}} .pick input{{width:18px;height:18px;margin:0;accent-color:var(--green)}} .entry-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 24px}} .entry{{display:block;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);text-decoration:none;color:var(--ink)}} .entry strong{{display:block;margin-bottom:5px}} .entry span{{display:block;color:var(--muted);font-size:13px}} .copy{{background:var(--green)}} .generated-image{{display:block;width:100%;height:auto;border-radius:12px;border:1px solid var(--line);background:#fff}}
 @media(max-width:760px){{main{{padding:28px 14px}}header{{display:block}}header .sub{{margin-top:12px}}h1{{font-size:34px}}.grid,.entry-grid{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main><script>
-document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate'], form[action='/today-note-generate'], form[action='/thumbnail-generate']").forEach((form) => {{
+document.querySelectorAll("form[action='/suggest'], form[action='/draft'], form[action='/direction'], form[action='/x-generate'], form[action='/today-note-generate'], form[action='/today-note-from-item-generate'], form[action='/thumbnail-generate']").forEach((form) => {{
   form.addEventListener("submit", () => {{
     const button = form.querySelector("button");
     button.disabled = true;
-    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : form.action.endsWith("/today-note-generate") ? "今日のこれを作っています…" : form.action.endsWith("/thumbnail-generate") ? "Youがサムネ画像を作っています…（数分かかることがあります）" : "Youがテーマを考えています…";
+    button.textContent = form.action.endsWith("/draft") ? "Youがnoteの下書きを作っています…" : form.action.endsWith("/direction") ? "note記事化フローと方向性を整理しています…" : form.action.endsWith("/x-generate") ? "YouがX投稿文を作っています…" : form.action.includes("/today-note") ? "今日のこれを作っています…" : form.action.endsWith("/thumbnail-generate") ? "Youがサムネ画像を作っています…（数分かかることがあります）" : "Youがテーマを考えています…";
   }});
 }});
 document.querySelectorAll("[data-copy]").forEach((button) => {{
@@ -1896,7 +2012,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             self.send_thumbnail_file(image_path, query.get("download", [""])[0] == "1")
             return
-        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize", "/thumbnail", "/thumbnail-settings", "/today-note"}:
+        if route.path not in {"/", "/themes", "/theme-run", "/article-form", "/finish", "/choose-sources", "/context", "/x-post", "/x-choose-sources", "/organize", "/thumbnail", "/thumbnail-settings", "/today-note", "/today-note-from-item"}:
             self.send_html(page("見つかりません", "<h1>見つかりません</h1>"), 404)
             return
         flow = active_flow()
@@ -1946,6 +2062,13 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             return
         if route.path == "/today-note":
             self.send_html(today_note_page())
+            return
+        if route.path == "/today-note-from-item":
+            item = flow_item(flow["id"], query.get("item_id", [""])[0])
+            if not item:
+                self.send_html(page("見つかりません", "<h1>選んだ情報が見つかりません</h1><p class='message'>情報が整理された可能性があります。今の一覧から選び直してください。</p><p><a class='button' href='/'>保存した情報へ戻る</a></p>"), 404)
+                return
+            self.send_html(today_note_from_item_page(item))
             return
         if route.path == "/x-choose-sources":
             source_cards = "".join(
@@ -2034,7 +2157,8 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             f"{item_source_html(item)}"
             f"<div class='summary'>{html.escape(item['summary'])}</div>"
             f"<div class='note'><strong>自分のメモ</strong><br>{html.escape(item['note']) or 'まだメモはありません。'}</div>"
-            f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form></div></article>"
+            f"<div class='actions'><form method='post' action='/x-generate' class='inline-form'><input type='hidden' name='item_ids' value='{item['id']}'><button class='button outline' type='submit'>この情報からX投稿をつくる</button></form><a class='button outline' href='/today-note-from-item?item_id={item['id']}'>今日のこれをつくる</a></div>"
+            f"<p class='hint'>Substack Notes用・400字前後の短い投稿を考える</p></article>"
             for item in items
         ) or "<div class='empty'>まだ何もありません。最初のURLを入れてみよう。</div>"
         theme_cards = ""
@@ -2046,7 +2170,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             ) or "<div class='empty'>まず記事を保存すると、ここに考える入口が出る。</div>"
         body = f"""
 <header><div><p class='eyebrow'>PRIVATE KNOWLEDGE INBOX</p><h1>Personal Flow</h1></div><p class='sub'>流れてきた情報を受け取り、あとで自分の言葉とnoteへつなげるための、あなた専用の場所。</p></header>
-<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/today-note'><strong>今日のこれ</strong><span>今日出会って残った一つを、Substack Notes用の短いメモにする。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ画像をつくる</strong><span>完成記事を貼るだけで、いつもの参考画像2枚を使って画像まで作る。</span></a></section>
+<section class='entry-grid'><a class='entry' href='#save'><strong>情報をためる</strong><span>URLとメモを残して、記事の材料を集める。</span></a><a class='entry' href='/today-note'><strong>今日のこれ（自由入力）</strong><span>URLや文章を自分で入れて、Substack Notes用の短いメモにする。</span></a><a class='entry' href='/x-post'><strong>X投稿をつくる</strong><span>文章や画像を直接入れて、投稿文を作る。</span></a><a class='entry' href='/x-choose-sources'><strong>ためた情報からX投稿をつくる</strong><span>保存済みの記事を選んで、投稿文を作る。</span></a><a class='entry' href='/thumbnail'><strong>Claude完成記事からサムネ画像をつくる</strong><span>完成記事を貼るだけで、いつもの参考画像2枚を使って画像まで作る。</span></a></section>
 {("<p class='message'>完成した記事を保存しました。URLを使わず、貼り付けた本文だけから要点を表示しています。</p>" if query.get("saved", [""])[0] == "pasted" else "")}
 <div class='grid'><div class='stack'><section class='panel' id='save'><h2>URLから情報をためる</h2><p class='hint'>記事や動画のURLと、自分の一言メモを残します。</p>
 <form method='post' action='/save'><label>記事・動画・ページのURL</label><input name='url' type='url' placeholder='https://...' required>
@@ -2196,6 +2320,25 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 self.send_html(today_note_result_page(make_today_note(encounter, reaction)))
             except (RuntimeError, OSError) as error:
                 self.send_html(today_note_page(str(error)), 400)
+            return
+        if self.path == "/today-note-from-item-generate":
+            length = int(self.headers.get("Content-Length", "0"))
+            values = parse_qs(self.rfile.read(length).decode())
+            item_id = values.get("item_id", [""])[0]
+            reaction = values.get("reaction", [""])[0].strip()
+            item = flow_item(active_flow()["id"], item_id)
+            if not item:
+                self.send_html(page("見つかりません", "<h1>選んだ情報が見つかりません</h1><p class='message'>情報が整理された可能性があります。別の情報を選んでください。何も作成していません。</p><p><a class='button' href='/'>保存した情報へ戻る</a></p>"), 404)
+                return
+            try:
+                text = make_today_note_from_item(item, reaction)
+                self.send_html(today_note_from_item_result_page(text, item["id"]))
+            except CodexRunError as error:
+                record_local_error("today_note_from_item", error.code, str(error))
+                self.send_html(today_note_from_item_page(item, str(error), reaction), 504 if error.code == "timeout" else 502)
+            except (RuntimeError, OSError) as error:
+                record_local_error("today_note_from_item", "generation_failed", str(error))
+                self.send_html(today_note_from_item_page(item, str(error), reaction), 400)
             return
         if self.path == "/x-generate":
             content_type = self.headers.get("Content-Type", "")

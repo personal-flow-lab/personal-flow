@@ -477,6 +477,132 @@ class TodayNoteTests(unittest.TestCase):
         self.assertIn("today-note-generate", app.today_note_page().decode())
         self.assertIn("今日のこれを作っています", app.today_note_page().decode())
 
+    def test_saved_item_prompt_uses_only_that_item_and_foundation(self) -> None:
+        item = {
+            "id": 7,
+            "url": "",
+            "title": "選んだ完成記事",
+            "article": "選んだ記事の具体的な本文。",
+            "summary": "選んだ記事の要点。",
+            "note": "自分が残したメモ。",
+        }
+        output = ("選んだ内容の具体的な一点が、自分には妙に残った。うまく説明しきれないけれど、もう少し考えてみたい。" * 12)[:380]
+        with (
+            patch.object(app, "ask_codex", return_value=json.dumps({"text": output}, ensure_ascii=False)) as mocked,
+            patch.object(app, "user_context", return_value="本人の土台にある書き方と考え方。"),
+        ):
+            result = app.make_today_note_from_item(item, "今回足した本人の言葉")
+        self.assertEqual(result, output)
+        prompt = mocked.call_args.args[0]
+        for expected in ("選んだ完成記事", "自分が残したメモ", "今回足した本人の言葉", "本人の土台にある書き方と考え方", "400字前後", "文字数だけのために水増ししない"):
+            self.assertIn(expected, prompt)
+        self.assertTrue(mocked.call_args.kwargs["ignore_user_config"])
+        self.assertEqual(mocked.call_args.kwargs["model"], app.X_POST_MODEL)
+
+    def test_saved_item_post_retries_unusual_length_without_strict_400_limit(self) -> None:
+        item = {"id": 8, "url": "https://example.com", "title": "短い材料", "article": "具体的な本文。" * 20, "summary": "要点", "note": ""}
+        too_short = json.dumps({"text": "短すぎる案"}, ensure_ascii=False)
+        natural_shorter = ("中心の気づきを、自分の言葉で短く残したい。" * 12)[:220]
+        with (
+            patch.object(app, "ask_codex", side_effect=[too_short, json.dumps({"text": natural_shorter}, ensure_ascii=False)]) as mocked,
+            patch.object(app, "user_context", return_value=""),
+            patch.object(app, "record_local_error"),
+        ):
+            result = app.make_today_note_from_item(item)
+        self.assertEqual(result, natural_shorter)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertIn("水増しをせず", mocked.call_args_list[1].args[0])
+
+
+class TodayNoteFromItemHttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(app, "DB_PATH", Path(self.temp.name) / "today-note-item.db")
+        self.db_patch.start()
+        flow = app.active_flow()
+        with app.database() as connection:
+            self.url_item_id = connection.execute(
+                "INSERT INTO items(url, title, article, summary, note, created_at, flow_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("https://example.com/source", "URLで保存した記事", "URL記事の本文。" * 80, "URL記事の要点", "URL記事の本人メモ", "2026-08-20 10:00", flow["id"]),
+            ).lastrowid
+            self.pasted_item_id = connection.execute(
+                "INSERT INTO items(url, title, article, summary, note, created_at, flow_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("", "貼り付けた完成記事", "完成記事の本文。" * 80, "完成記事の要点", "", "2026-08-20 11:00", flow["id"]),
+            ).lastrowid
+
+    def tearDown(self) -> None:
+        self.db_patch.stop()
+        self.temp.cleanup()
+
+    def request(self, method: str, path: str, values: list[tuple[str, str]] | None = None) -> tuple[int, str]:
+        handler = HandlerHarness(method, path, values)
+        return handler.status, handler.body
+
+    def test_cards_offer_clear_dedicated_entry_for_both_source_types(self) -> None:
+        status, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("今日のこれ（自由入力）", body)
+        self.assertEqual(body.count("今日のこれをつくる"), 2)
+        self.assertEqual(body.count("Substack Notes用・400字前後の短い投稿を考える"), 2)
+        self.assertIn(f"/today-note-from-item?item_id={self.url_item_id}", body)
+        self.assertIn(f"/today-note-from-item?item_id={self.pasted_item_id}", body)
+
+    def test_preparation_page_identifies_selected_item_without_generating(self) -> None:
+        with patch.object(app, "make_today_note_from_item") as mocked:
+            status, url_body = self.request("GET", f"/today-note-from-item?item_id={self.url_item_id}")
+            self.assertEqual(status, 200)
+            self.assertIn("URLで保存した記事", url_body)
+            self.assertIn("URLで保存した情報", url_body)
+            self.assertIn("この画面を開いただけでは文章作成は始まりません", url_body)
+            status, pasted_body = self.request("GET", f"/today-note-from-item?item_id={self.pasted_item_id}")
+            self.assertEqual(status, 200)
+            self.assertIn("貼り付けた完成記事", pasted_body)
+            self.assertIn("URLなし・貼り付けた完成記事", pasted_body)
+        mocked.assert_not_called()
+
+    def test_generation_uses_exact_item_and_does_not_change_saved_data(self) -> None:
+        before = [(row["id"], row["title"], row["article"]) for row in app.flow_items(app.active_flow()["id"])]
+        output = ("選んだ情報から残った具体的な一点を、自分の言葉で短く書いた。" * 15)[:360]
+        with patch.object(app, "make_today_note_from_item", return_value=output) as mocked:
+            status, body = self.request(
+                "POST",
+                "/today-note-from-item-generate",
+                [("item_id", str(self.pasted_item_id)), ("reaction", "ここが自分に残った")],
+            )
+        self.assertEqual(status, 200)
+        self.assertIn(output, body)
+        self.assertIn("この投稿文をコピー", body)
+        selected_item = mocked.call_args.args[0]
+        self.assertEqual(selected_item["id"], self.pasted_item_id)
+        self.assertEqual(mocked.call_args.args[1], "ここが自分に残った")
+        after = [(row["id"], row["title"], row["article"]) for row in app.flow_items(app.active_flow()["id"])]
+        self.assertEqual(after, before)
+
+    def test_missing_or_deleted_item_stops_safely(self) -> None:
+        status, body = self.request("GET", "/today-note-from-item?item_id=not-a-number")
+        self.assertEqual(status, 404)
+        self.assertIn("選んだ情報が見つかりません", body)
+        with app.database() as connection:
+            connection.execute("DELETE FROM items WHERE id = ?", (self.url_item_id,))
+        with patch.object(app, "make_today_note_from_item") as mocked:
+            status, body = self.request("POST", "/today-note-from-item-generate", [("item_id", str(self.url_item_id))])
+        self.assertEqual(status, 404)
+        self.assertIn("何も作成していません", body)
+        mocked.assert_not_called()
+
+    def test_timeout_keeps_selected_item_and_reaction_for_retry(self) -> None:
+        error = app.CodexRunError("timeout", "返答に時間がかかりました。もう一度試してください。")
+        with patch.object(app, "make_today_note_from_item", side_effect=error), patch.object(app, "record_local_error"):
+            status, body = self.request(
+                "POST",
+                "/today-note-from-item-generate",
+                [("item_id", str(self.url_item_id)), ("reaction", "残したい本人の言葉")],
+            )
+        self.assertEqual(status, 504)
+        self.assertIn("URLで保存した記事", body)
+        self.assertIn("残したい本人の言葉", body)
+        self.assertIn("today-note-from-item-generate", body)
+
 
 class ThemeSuggestionTests(unittest.TestCase):
     def run_suggestion(self, output: str) -> list[dict[str, object]]:
