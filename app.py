@@ -811,6 +811,7 @@ def build_draft_prompt(
     theme: dict[str, object],
     items: list[sqlite3.Row],
     direction: str,
+    personal_material: str,
     user_memo: str,
     length: str,
     context: str,
@@ -833,6 +834,7 @@ def build_draft_prompt(
     memo_limit = 1800 if compact else 2800
     context_limit = 900 if compact else 1200
     approach_limit = 1200 if compact else 1800
+    personal_limit = 1800 if compact else 2800
     retry_note = "今回は短くした材料を使い、内容を広げすぎず完成させてください。\n" if compact else ""
     return f"""あなたはnote記事化フローの実行役です。
 {retry_note}以下の材料だけを使い、指定された長さの記事の下書きを作ってください。ツール、検索、ファイル操作は不要です。
@@ -846,6 +848,9 @@ def build_draft_prompt(
 【固めた方向性】
 {direction[:direction_limit] or 'まだ方向性の追加情報はありません。'}
 
+【今回の記事に必ず入れる、本人が実際に見た・試した・考えたこと（最優先）】
+{personal_material[:personal_limit]}
+
 【本人の追加メモ】
 {user_memo[:memo_limit] or 'まだ追加メモはありません。保存記事から分かる事実だけを使い、足りない本人の体験は作らない。'}
 
@@ -857,6 +862,9 @@ def build_draft_prompt(
 
 【記事づくりの重要ルール】
 {draft_rules_digest()}
+- 「本人が実際に見た・試した・考えたこと」を本文の中心に置き、必ず具体的に反映する。
+- 保存記事は背景や補助線として使い、表現を言い換えただけの本文にしない。
+- 本人の材料にない体験、場面、会話、数字、成果は作り足さない。
 
 【本人の土台】
 {context[:context_limit] or 'まだ土台はありません。保存記事と本人メモだけを根拠にする。'}
@@ -948,21 +956,27 @@ def make_note_draft(
     theme: dict[str, object],
     items: list[sqlite3.Row],
     direction: str,
+    personal_material: str,
     user_memo: str,
     length: str,
 ) -> str:
     """Create a full draft in an isolated process, with one smaller automatic retry."""
+    if not personal_material.strip():
+        raise DraftGenerationError(
+            "missing_personal_material",
+            "今回の記事に入れたい自分のことを書いてから、下書きを作ってください。短くて大丈夫です。",
+        )
     context = user_context()
     attempts = [
         (
             "primary",
-            build_draft_prompt(theme, items, direction, user_memo, length, context),
+            build_draft_prompt(theme, items, direction, personal_material, user_memo, length, context),
             DRAFT_PRIMARY_TIMEOUT,
             DRAFT_MODEL,
         ),
         (
             "compact_retry",
-            build_draft_prompt(theme, items, direction, user_memo, length, context, compact=True),
+            build_draft_prompt(theme, items, direction, personal_material, user_memo, length, context, compact=True),
             DRAFT_RETRY_TIMEOUT,
             DRAFT_RETRY_MODEL,
         ),
@@ -1856,11 +1870,35 @@ def direction_suggestion_error_page(
     return page("方向性を固められませんでした", body)
 
 
+def direction_result_page(
+    run_id: int,
+    theme: dict[str, object],
+    theme_index: str,
+    direction_run_id: int,
+    result: str,
+    message: str = "",
+    personal_material: str = "",
+) -> bytes:
+    """Show one required personal-material field for either refining or continuing."""
+    notice = f"<p class='message'>{html.escape(message)}</p>" if message else ""
+    body = f"""
+    <header><div><p class='eyebrow'>DIRECTION WITH NOTE FLOW</p><h1>記事の方向性を固める</h1></div><p class='sub'>note記事化フローのルールと、選んだ保存記事を使って整理した結果です。</p></header>
+    <section class='panel'>{notice}<h2>{html.escape(str(theme['title']))}</h2><div class='summary'>{html.escape(result)}</div>
+    <form method='post' action='/direction'><input type='hidden' name='direction_run_id' value='{direction_run_id}'><input type='hidden' name='theme' value='{html.escape(theme_index, quote=True)}'>
+    <label>今回の記事に必ず入れたい、自分のこと（必須）</label>
+    <textarea name='direction' required placeholder='自分で試したこと／仕事や生活で見たこと／これを読んで思ったこと／うまくいかなかったこと。短くて大丈夫です。'>{html.escape(personal_material)}</textarea>
+    <p class='hint'>短くても大丈夫です。保存記事の要約だけにせず、あなたが実際に見た・試した・考えたことを記事の中心にします。</p>
+    <div class='actions'><button type='submit' name='direction_action' value='refine'>追加の思いを入れて、もう一度方向性を固める</button>
+    <button class='outline' type='submit' name='direction_action' value='continue'>この方向でnote記事の下書きを作る</button></div></form></section>"""
+    return page("記事の方向性", body)
+
+
 def draft_generation_error_page(
     error: DraftGenerationError,
     run_id: int,
     theme_index: str,
     direction: str,
+    personal_material: str,
     memo: str,
     length: str,
 ) -> bytes:
@@ -1869,6 +1907,7 @@ def draft_generation_error_page(
         f"<input type='hidden' name='run_id' value='{run_id}'>"
         f"<input type='hidden' name='theme' value='{html.escape(theme_index, quote=True)}'>"
         f"<input type='hidden' name='direction' value='{html.escape(direction, quote=True)}'>"
+        f"<input type='hidden' name='personal_material' value='{html.escape(personal_material, quote=True)}'>"
         f"<input type='hidden' name='memo' value='{html.escape(memo, quote=True)}'>"
         f"<input type='hidden' name='length' value='{html.escape(length, quote=True)}'>"
         "<button type='submit'>同じ内容でもう一度試す</button></form>"
@@ -2141,12 +2180,33 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             direction = query.get("direction", [""])[0].strip()
             direction_run = self.load_direction_run(query)
             if direction_run:
+                if direction_run["theme_run_id"] != run["id"] or direction_run["theme_index"] != int(query.get("theme", ["0"])[0]):
+                    self.send_html(page("見つかりません", "<h1>選んだ方向性が見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
+                    return
+                personal_material = str(direction_run["direction_notes"] or "").strip()
+                if not personal_material:
+                    self.send_html(
+                        direction_result_page(
+                            run["id"],
+                            theme,
+                            query.get("theme", ["0"])[0],
+                            direction_run["id"],
+                            direction_run["result"],
+                            "今回の記事に入れたい自分のことを書いてから、下書きへ進んでください。短くて大丈夫です。",
+                        ),
+                        400,
+                    )
+                    return
                 direction = "\n\n".join(part for part in [direction, direction_run["result"]] if part)
+            else:
+                self.send_html(page("自分のことを入れてください", f"<h1>今回の記事に入れたい自分のことがまだありません</h1><p class='message'>方向性を固める画面で、自分が見た・試した・考えたことを短く入れてください。</p><p><a class='button' href='/theme-run?id={run['id']}'>テーマの画面へ戻る</a></p>"), 400)
+                return
             direction_note = f"<div class='note'><strong>テーマを選ぶ時に書いたこと</strong><br>{html.escape(direction)}</div>" if direction else ""
+            personal_note = f"<div class='note'><strong>今回の記事に必ず入れる自分のこと</strong><br>{html.escape(personal_material)}</div>"
             body = f"""
             <header><div><p class='eyebrow'>NOTE ARTICLE FLOW</p><h1>記事にする前のメモ</h1></div><p class='sub'>テーマと保存記事はすでに渡ります。ここには、あなた自身の出来事や本音だけを足してください。</p></header>
-            <section class='panel'><h2>{html.escape(str(theme['title']))}</h2><p class='hint'>{html.escape(str(theme['approach']))}</p>{direction_note}
-            <form method='post' action='/draft'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{query.get('theme', ['0'])[0]}'><input type='hidden' name='direction' value='{html.escape(direction, quote=True)}'>
+            <section class='panel'><h2>{html.escape(str(theme['title']))}</h2><p class='hint'>{html.escape(str(theme['approach']))}</p>{personal_note}{direction_note}
+            <form method='post' action='/draft'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{query.get('theme', ['0'])[0]}'><input type='hidden' name='direction' value='{html.escape(direction, quote=True)}'><input type='hidden' name='personal_material' value='{html.escape(personal_material, quote=True)}'>
             <label>希望文字数</label><input name='length' value='約2,000字'>
             <label>自分メモ（任意）</label><textarea name='memo' placeholder='実際にあったこと／自分が思ったこと／残したい言葉。箇条書きで大丈夫です。'></textarea>
             <button class='primary' type='submit'>note記事の下書きを作る</button></form></section>"""
@@ -2459,10 +2519,39 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
             if not items or not referenced_theme_items(theme, items):
                 self.send_html(missing_theme_sources_page(), 409)
                 return
+            direction_action = values.get("direction_action", [""])[0]
             addition = values.get("direction", [""])[0].strip()
-            prior_notes = direction_run["direction_notes"] if direction_run else ""
-            combined_notes = "\n\n".join(part for part in [prior_notes, addition] if part)
             previous = direction_run["result"] if direction_run else ""
+            if direction_action in {"refine", "continue"} and not direction_run:
+                self.send_html(page("見つかりません", "<h1>固めた方向性が見つかりません</h1><p><a href='/'>保存した情報へ戻る</a></p>"), 404)
+                return
+            if direction_action in {"refine", "continue"} and not addition:
+                self.send_html(
+                    direction_result_page(
+                        run["id"],
+                        theme,
+                        theme_index,
+                        direction_run["id"],
+                        previous,
+                        "今回の記事に入れたい自分のことを書いてください。短くて大丈夫です。",
+                    ),
+                    400,
+                )
+                return
+            combined_notes = addition
+            if direction_action == "continue":
+                with database() as connection:
+                    cursor = connection.execute(
+                        "INSERT INTO direction_runs(theme_run_id, theme_index, direction_notes, result, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (run["id"], int(theme_index), combined_notes, previous, datetime.now().strftime("%Y-%m-%d %H:%M")),
+                    )
+                self.send_response(303)
+                self.send_header(
+                    "Location",
+                    f"/article-form?run_id={run['id']}&theme={theme_index}&direction_run_id={cursor.lastrowid}",
+                )
+                self.end_headers()
+                return
             try:
                 result = refine_note_direction(theme, items, combined_notes, previous)
                 with database() as connection:
@@ -2470,14 +2559,16 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                         "INSERT INTO direction_runs(theme_run_id, theme_index, direction_notes, result, created_at) VALUES (?, ?, ?, ?, ?)",
                         (run["id"], int(theme_index), combined_notes, result, datetime.now().strftime("%Y-%m-%d %H:%M")),
                     )
-                body = f"""
-                <header><div><p class='eyebrow'>DIRECTION WITH NOTE FLOW</p><h1>記事の方向性を固める</h1></div><p class='sub'>note記事化フローのルールと、選んだ保存記事を使って整理した結果です。</p></header>
-                <section class='panel'><h2>{html.escape(str(theme['title']))}</h2><div class='summary'>{html.escape(result)}</div>
-                <form method='post' action='/direction'><input type='hidden' name='direction_run_id' value='{cursor.lastrowid}'><input type='hidden' name='theme' value='{theme_index}'>
-                <label>追加で伝えたいこと（任意）</label><textarea name='direction' placeholder='質問への答え／自分の経験／残したい言葉。もう一度整理したい時だけ書いてください。'></textarea>
-                <div class='actions'><button type='submit'>追加の思いを入れて、もう一度方向性を固める</button></div></form>
-                <form method='get' action='/article-form'><input type='hidden' name='run_id' value='{run['id']}'><input type='hidden' name='theme' value='{theme_index}'><input type='hidden' name='direction_run_id' value='{cursor.lastrowid}'><div class='actions'><button class='outline' type='submit'>この方向でnote記事の下書きを作る</button></div></form></section>"""
-                self.send_html(page("記事の方向性", body))
+                self.send_html(
+                    direction_result_page(
+                        run["id"],
+                        theme,
+                        theme_index,
+                        cursor.lastrowid,
+                        result,
+                        personal_material=combined_notes,
+                    )
+                )
             except DirectionSuggestionError as error:
                 status = 504 if error.code == "timeout" else 502
                 self.send_html(
@@ -2505,7 +2596,12 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 return
             memo = values.get("memo", [""])[0].strip()
             direction = values.get("direction", [""])[0].strip()
+            personal_material = values.get("personal_material", [""])[0].strip()
             desired_length = values.get("length", [""])[0].strip()
+            if not personal_material:
+                body = f"<h1>今回の記事に入れたい自分のことが必要です</h1><p class='message'>自分で見た・試した・考えたことを短く入れてから、下書きを作ってください。</p><p><a class='button' href='/theme-run?id={run['id']}'>テーマの画面へ戻る</a></p>"
+                self.send_html(page("自分のことを入れてください", body), 400)
+                return
             proposal = json.loads(run["proposal_json"])
             selected_ids = [str(item_id) for item_id in proposal.get("item_ids", [])]
             items = exact_flow_items(run["flow_id"], selected_ids)
@@ -2513,7 +2609,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                 self.send_html(missing_theme_sources_page(), 409)
                 return
             try:
-                draft = make_note_draft(theme, items, direction, memo, desired_length)
+                draft = make_note_draft(theme, items, direction, personal_material, memo, desired_length)
                 self.send_html(draft_result_page(draft))
             except DraftGenerationError as error:
                 status = 504 if error.code == "timeout" else 502
@@ -2523,6 +2619,7 @@ class PersonalFlowHandler(BaseHTTPRequestHandler):
                         run["id"],
                         values.get("theme", [""])[0],
                         direction,
+                        personal_material,
                         memo,
                         desired_length,
                     ),

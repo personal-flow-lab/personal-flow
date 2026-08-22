@@ -800,6 +800,7 @@ class DraftGenerationTests(unittest.TestCase):
                 self.draft_theme(),
                 items,
                 "方向性の中心と外す要素",
+                "今回必ず入れる本人のこと",
                 "今回の本人メモ",
                 "約2,000字",
                 "本人の土台",
@@ -812,6 +813,7 @@ class DraftGenerationTests(unittest.TestCase):
                 "本人の保存メモ",
                 "選んだテーマ",
                 "方向性の中心と外す要素",
+                "今回必ず入れる本人のこと",
                 "今回の本人メモ",
                 "約2,000字",
                 "本人の土台",
@@ -826,7 +828,7 @@ class DraftGenerationTests(unittest.TestCase):
             patch.object(app, "ask_codex", return_value=valid_draft()) as mocked,
             patch.object(app, "user_context", return_value="本人の土台"),
         ):
-            result = app.make_note_draft(self.draft_theme(), [sample_item()], "方向性", "本人メモ", "約2,000字")
+            result = app.make_note_draft(self.draft_theme(), [sample_item()], "方向性", "本人が実際に試したこと", "本人メモ", "約2,000字")
         self.assertIn("本文初稿", result)
         _, kwargs = mocked.call_args
         self.assertTrue(kwargs["ignore_user_config"])
@@ -839,6 +841,7 @@ class DraftGenerationTests(unittest.TestCase):
             self.draft_theme(),
             [sample_item(article="今回、実際に試した操作とつまずき")],
             "方向性",
+            "本人が実際に試した操作とつまずき",
             "本人メモ",
             "約2,000字",
             "本人の土台",
@@ -852,10 +855,23 @@ class DraftGenerationTests(unittest.TestCase):
             "外部の書き手の言い回し・見出し",
         ):
             self.assertIn(expected, prompt)
+        for expected in (
+            "今回の記事に必ず入れる、本人が実際に見た・試した・考えたこと（最優先）",
+            "本人が実際に試した操作とつまずき",
+            "保存記事は背景や補助線として使い、表現を言い換えただけの本文にしない",
+            "本人の材料にない体験、場面、会話、数字、成果は作り足さない",
+        ):
+            self.assertIn(expected, prompt)
+
+    def test_draft_requires_personal_material_before_calling_codex(self) -> None:
+        with patch.object(app, "ask_codex") as mocked, patch.object(app, "user_context", return_value=""):
+            with self.assertRaisesRegex(app.DraftGenerationError, "自分のこと"):
+                app.make_note_draft(self.draft_theme(), [sample_item()], "方向性", "", "任意メモ", "約2,000字")
+        mocked.assert_not_called()
 
     def test_draft_prompt_does_not_use_generic_identity_as_opening_instruction(self) -> None:
         prompt = app.build_draft_prompt(
-            self.draft_theme(), [sample_item()], "方向性", "本人メモ", "約2,000字", "本人の土台"
+            self.draft_theme(), [sample_item()], "方向性", "本人が実際に考えたこと", "本人メモ", "約2,000字", "本人の土台"
         )
         self.assertNotIn("冒頭はパソコンとAIを触り始めた", prompt)
 
@@ -869,12 +885,12 @@ class DraftGenerationTests(unittest.TestCase):
             patch.object(app, "user_context", return_value="本人の土台"),
             patch.object(app, "record_local_error"),
         ):
-            app.make_note_draft(self.draft_theme(), [sample_item(article="本文" * 3000)], "方向性", "本人メモ", "約2,000字")
+            app.make_note_draft(self.draft_theme(), [sample_item(article="本文" * 3000)], "方向性", "本人が実際に見たこと", "本人メモ", "約2,000字")
         self.assertEqual(mocked.call_count, 2)
         primary = mocked.call_args_list[0].args[0]
         retry = mocked.call_args_list[1].args[0]
         self.assertLess(len(retry), len(primary))
-        for value in ("選んだテーマ", "方向性", "本人メモ", "約2,000字", "本人の土台", "成功談は外す"):
+        for value in ("選んだテーマ", "方向性", "本人が実際に見たこと", "本人メモ", "約2,000字", "本人の土台", "成功談は外す"):
             self.assertIn(value, retry)
         self.assertEqual(mocked.call_args_list[1].kwargs["model"], app.DRAFT_RETRY_MODEL)
         self.assertEqual(mocked.call_args_list[1].kwargs["timeout"], app.DRAFT_RETRY_TIMEOUT)
@@ -885,29 +901,30 @@ class DraftGenerationTests(unittest.TestCase):
             patch.object(app, "user_context", return_value=""),
             patch.object(app, "record_local_error"),
         ):
-            result = app.make_note_draft(self.draft_theme(), [sample_item()], "", "", "約2,000字")
+            result = app.make_note_draft(self.draft_theme(), [sample_item()], "", "本人が実際に試したこと", "", "約2,000字")
         self.assertEqual(mocked.call_count, 2)
         self.assertIn("公開前チェック", result)
 
     def test_draft_error_page_keeps_theme_direction_memo_and_length(self) -> None:
         error = app.DraftGenerationError("timeout", "時間切れです")
         result = app.draft_generation_error_page(
-            error, 20, "0", "方向性'&", "本人メモ", "約2,000字"
+            error, 20, "0", "方向性'&", "必ず入れる本人のこと", "本人メモ", "約2,000字"
         ).decode()
         self.assertIn("同じ内容でもう一度試す", result)
         self.assertIn("name='run_id' value='20'", result)
         self.assertIn("方向性&#x27;&amp;", result)
+        self.assertIn("必ず入れる本人のこと", result)
         self.assertIn("本人メモ", result)
         self.assertIn("約2,000字", result)
 
     def test_missing_material_is_told_not_to_be_invented(self) -> None:
-        prompt = app.build_draft_prompt(self.draft_theme(), [sample_item(article="")], "", "", "約2,000字", "")
+        prompt = app.build_draft_prompt(self.draft_theme(), [sample_item(article="")], "", "本人が見たこと", "", "約2,000字", "")
         self.assertIn("本人が話していない出来事", prompt)
         self.assertIn("足りない本人の体験は作らない", prompt)
 
     def test_hashtags_are_grounded_limited_and_parseable(self) -> None:
         prompt = app.build_draft_prompt(
-            self.draft_theme(), [sample_item()], "方向性", "本人メモ", "約2,000字", "本人の土台"
+            self.draft_theme(), [sample_item()], "方向性", "本人が考えたこと", "本人メモ", "約2,000字", "本人の土台"
         )
         for rule in ("記事の種類", "中心テーマ", "具体的な悩みや問い", "関連語", "一般的な人気タグで水増ししない"):
             self.assertIn(rule, prompt)
@@ -922,7 +939,7 @@ class DraftGenerationTests(unittest.TestCase):
             patch.object(app, "user_context", return_value=""),
             patch.object(app, "record_local_error"),
         ):
-            result = app.make_note_draft(self.draft_theme(), [sample_item()], "", "", "約2,000字")
+            result = app.make_note_draft(self.draft_theme(), [sample_item()], "", "本人が考えたこと", "", "約2,000字")
         self.assertEqual(mocked.call_count, 2)
         self.assertEqual(len(app.parse_hashtag_suggestions(result)), 5)
 
@@ -1209,16 +1226,33 @@ class ArticleFlowHttpTests(unittest.TestCase):
             status, _, direction_page = self.request("POST", "/direction", [("run_id", str(run_id)), ("theme", "0")])
             self.assertEqual(status, 200)
             self.assertIn("記事の方向性を固める", direction_page)
+            self.assertIn("今回の記事に必ず入れたい、自分のこと（必須）", direction_page)
+            self.assertIn("自分で試したこと／仕事や生活で見たこと", direction_page)
+            self.assertIn("name='direction' required", direction_page)
             with app.database() as connection:
                 direction_id = connection.execute("SELECT id FROM direction_runs ORDER BY id DESC LIMIT 1").fetchone()[0]
-            status, _, form_page = self.request("GET", f"/article-form?run_id={run_id}&theme=0&direction_run_id={direction_id}")
+
+            status, _, blocked_page = self.request("GET", f"/article-form?run_id={run_id}&theme=0&direction_run_id={direction_id}")
+            self.assertEqual(status, 400)
+            self.assertIn("自分のことを書いてから", blocked_page)
+
+            personal_material = "自分で実際に試したら、最初はうまくいかず、やり直して見え方が変わった。"
+            status, headers, _ = self.request(
+                "POST",
+                "/direction",
+                [("direction_run_id", str(direction_id)), ("theme", "0"), ("direction", personal_material), ("direction_action", "continue")],
+            )
+            self.assertEqual(status, 303)
+            status, _, form_page = self.request("GET", headers["Location"])
             self.assertEqual(status, 200)
             self.assertIn("note記事の下書きを作る", form_page)
+            self.assertIn("今回の記事に必ず入れる自分のこと", form_page)
+            self.assertIn(personal_material, form_page)
 
             status, _, draft_page = self.request(
                 "POST",
                 "/draft",
-                [("run_id", str(run_id)), ("theme", "0"), ("direction", "方向性の結果"), ("memo", "本人の追記メモ"), ("length", "約2,000字")],
+                [("run_id", str(run_id)), ("theme", "0"), ("direction", "方向性の結果"), ("personal_material", personal_material), ("memo", "本人の追記メモ"), ("length", "約2,000字")],
             )
             self.assertEqual(status, 200)
             for label in ("タイトル案", "記事の軸", "見出し", "本文初稿", "公開前チェック"):
@@ -1250,13 +1284,61 @@ class ArticleFlowHttpTests(unittest.TestCase):
             status, _, body = self.request(
                 "POST",
                 "/draft",
-                [("run_id", str(run_id)), ("theme", "0"), ("direction", "方向性"), ("memo", "本人メモ"), ("length", "約1,800字")],
+                [("run_id", str(run_id)), ("theme", "0"), ("direction", "方向性"), ("personal_material", "必ず入れる本人の実体験"), ("memo", "本人メモ"), ("length", "約1,800字")],
             )
         self.assertEqual(status, 504)
         self.assertEqual(mocked.call_count, 2)
         self.assertIn("同じ内容でもう一度試す", body)
-        for value in ("方向性", "本人メモ", "約1,800字"):
+        for value in ("方向性", "必ず入れる本人の実体験", "本人メモ", "約1,800字"):
             self.assertIn(value, body)
+
+    def test_empty_personal_material_cannot_continue_or_create_draft(self) -> None:
+        run_id = self.create_run()
+        with patch.object(app, "ask_codex", return_value="方向性") as mocked:
+            status, _, _ = self.request("POST", "/direction", [("run_id", str(run_id)), ("theme", "0")])
+        self.assertEqual(status, 200)
+        with app.database() as connection:
+            direction_id = connection.execute("SELECT id FROM direction_runs ORDER BY id DESC LIMIT 1").fetchone()[0]
+            before_runs = connection.execute("SELECT COUNT(*) FROM direction_runs").fetchone()[0]
+        status, _, body = self.request(
+            "POST",
+            "/direction",
+            [("direction_run_id", str(direction_id)), ("theme", "0"), ("direction_action", "continue")],
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("今回の記事に入れたい自分のことを書いてください", body)
+        with app.database() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM direction_runs").fetchone()[0], before_runs)
+        status, _, body = self.request(
+            "POST",
+            "/draft",
+            [("run_id", str(run_id)), ("theme", "0"), ("direction", "方向性"), ("memo", "任意メモ"), ("length", "約2,000字")],
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("自分で見た・試した・考えたこと", body)
+        self.assertEqual(mocked.call_count, 1)
+
+    def test_personal_material_can_refine_direction_and_is_kept(self) -> None:
+        run_id = self.create_run()
+        with patch.object(app, "ask_codex", side_effect=["最初の方向性", "本人のことを反映した方向性"]) as mocked:
+            status, _, _ = self.request("POST", "/direction", [("run_id", str(run_id)), ("theme", "0")])
+            self.assertEqual(status, 200)
+            with app.database() as connection:
+                direction_id = connection.execute("SELECT id FROM direction_runs ORDER BY id DESC LIMIT 1").fetchone()[0]
+            personal_material = "仕事で同じ失敗をして、翌日に手順を一つ変えて試した。"
+            status, _, body = self.request(
+                "POST",
+                "/direction",
+                [("direction_run_id", str(direction_id)), ("theme", "0"), ("direction", personal_material), ("direction_action", "refine")],
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("本人のことを反映した方向性", body)
+        self.assertIn(personal_material, body)
+        self.assertIn("name='direction' required", body)
+        with app.database() as connection:
+            saved = connection.execute("SELECT direction_notes FROM direction_runs ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(saved, personal_material)
+        self.assertEqual(mocked.call_count, 2)
 
     def test_organize_and_confirmation_are_visible_without_deleting(self) -> None:
         status, _, home = self.request("GET", "/")
